@@ -171,9 +171,12 @@ Borrowing does not select the target tab. Keep its returned `tab_id` and pass `-
 to subsequent observation, navigation, and input commands; omitting it still targets the Agent
 Window's active tab. Use the same explicit targeting after `tab create --no-active`. Created and
 borrowed web pages continue running in the background while controlled, without requiring
-`tab select`. A default created tab starts at `about:blank`. Ordinary viewport and full-page
-screenshots still require an active tab; do not activate a background task just to work around
-that limitation. Prefer semantic observation, and report the limitation when an image is required.
+`tab select`. A default created tab starts at `about:blank`. Ordinary viewport screenshots of
+controlled tabs also work in the background, using the same explicit `--tab-id`. Prefer semantic
+observation first and take a screenshot when the task needs image content. Full-page screenshots
+still require an active tab; do not activate a background task just to work around that limitation.
+A viewport screenshot does not issue a Canvas `capture_id`; use the existing `--ref` flow for
+screenshot-bound Canvas clicks.
 
 `tab borrow --timeout 120s` changes the confirmation wait (default 60s), not whether approval is
 required. Custom waits need daemon and extension protocol 1.2+. Compatible older peers can still
