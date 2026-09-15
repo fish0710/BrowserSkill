@@ -167,6 +167,14 @@ Normal page writes affect only Agent Window tabs. To operate a user tab, first l
 after the relevant step with `bsk tab return <tab-id>`; never invent a tab id or keep a personal tab
 borrowed across unrelated work.
 
+Borrowing does not select the target tab. Keep its returned `tab_id` and pass `--tab-id <tab-id>`
+to subsequent observation, navigation, and input commands; omitting it still targets the Agent
+Window's active tab. Use the same explicit targeting after `tab create --no-active`. Created and
+borrowed web pages continue running in the background while controlled, without requiring
+`tab select`. A default created tab starts at `about:blank`. Ordinary viewport and full-page
+screenshots still require an active tab; do not activate a background task just to work around
+that limitation. Prefer semantic observation, and report the limitation when an image is required.
+
 `tab borrow --timeout 120s` changes the confirmation wait (default 60s), not whether approval is
 required. Custom waits need daemon and extension protocol 1.2+. Compatible older peers can still
 start sessions and borrow with their default wait. The current CLI's `request-help` needs daemon
