@@ -24,6 +24,12 @@ Starting from 0.2.0, CLI / Extension / DSH Plugin share the same version number.
 - [Host-managed daemon setup](docs/sandboxed-agents.md) with `BSK_HOME` and
   `BSK_AUTO_START=0` for agents whose command sandboxes reap background processes
 - Configurable local connection port in the extension popup and Korean localization
+- Extension: virtual agent cursor that glides to the target and ripples on click before the
+  real input is dispatched, plus a current-action line on the control pill naming the tool
+  and its target
+- User takeover across CLI, Extension and daemon: "Take over" / "Return to agent" buttons with
+  an optional note for the agent, agent input blocked while the user holds control, and
+  `bsk session status` / `bsk session wait-control` for the agent to observe and wait out the hold
 
 ### Changed
 

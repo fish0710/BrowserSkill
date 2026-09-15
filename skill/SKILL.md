@@ -161,6 +161,16 @@ missing or viable approaches are exhausted; continue independent work. Do not lo
 on identical failures, repeat unknown effects or switch backends to bypass limits.
 On an unrecoverable failure, report the blocker and stop the owned session.
 
+### User takeover
+
+The user can press "Take over" in the Agent Window at any time. The session is then
+held (`control=user`) and every browser-input call is rejected with `tool dispatch
+rejected: the user has taken over this session (control=user)`. That means **stop
+acting**: do not retry or route around it. Run `bsk session wait-control --session <id>`;
+it blocks until control returns and prints the user's `note`. `bsk session status
+--session <id>` shows the state without blocking. Re-observe before continuing: the
+user may have navigated, filled or submitted something.
+
 ## Screenshots and Canvas
 
 ```sh
