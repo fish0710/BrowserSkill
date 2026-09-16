@@ -73,7 +73,9 @@ Task authorization and host approvals still apply.
 
 With a trace, follow its semantic target information and values in order, but treat its refs as
 record-local hints. Stop when its purpose or last meaningful effect is satisfied. A trace guides the
-task; it does not expand the user's goal or authorize additional actions.
+task; it does not expand the user's goal or authorize additional actions. A trace already distilled
+into site memory reads better as numbered steps: check `bsk site workflow show <id> --host <host>`
+before working from the raw trace.
 
 ## Observe, act, observe
 
@@ -230,6 +232,8 @@ observe   snapshot   get-html   screenshot   console   network
 click   hover   wheel   scroll-to   focus   blur   fill   select   press   evaluate
 tab list|create|close|select|borrow|return   window resize   emulate
 upload   download   request-help   record start|stop
+site context   site checkpoint
+site workflow save|list|show|verify   site candidate add|list|show
 ```
 
 Flags and argument forms that are easy to get wrong:
@@ -249,8 +253,9 @@ lowercase and hyphenated, such as `iphone-14`.
 - `evaluate` is a last resort when observe plus normal interactions cannot complete the task. With
   `--json`, inspect `.ok`: a JavaScript exception may still have CLI exit code 0 because the RPC
   succeeded. Never evaluate credential surfaces to read storage, cookies, or auth data.
-- `record` captures a user's actions for later replay. Read `bsk record start --help` before use,
-  and never record banking, SSO, password-manager, or other sensitive pages.
+- `record` captures actions for later replay — the user's, or with `--detach` your own. Read
+  `bsk record start --help` before use, and never record banking, SSO, password-manager, or other
+  sensitive pages.
 
 ## Screenshots
 
@@ -306,6 +311,79 @@ accepted the attachment. Observe the page once after the command.
 
 Download default-refuses to overwrite; pass `--overwrite` when replacing an existing file is
 intended. Read `bsk upload --help` and `bsk download --help` for all flags and error details.
+
+## Site memory
+
+`bsk site` keeps local, per-host notes so an explored flow is not re-explored: a constrained
+`SITE.md`, workflows derived from a recording, and candidate observations awaiting evidence. It is
+private to this machine, needs no daemon, and never stores credentials or recorded input values.
+
+```sh
+bsk site context --host <host> --task <task-id>
+bsk site workflow show <id> --host <host>
+bsk site workflow save --from ./rec/trace.json --id <id> --task <task-id>
+bsk site workflow verify <id> --host <host> --pass
+bsk site candidate add --host <host> --kind better_path --claim "<one sentence>"
+bsk site checkpoint --host <host> --task <task-id> --reason direct_correction
+```
+
+Three rules govern its use:
+
+- **Read before acting.** When a task names a site, run `bsk site context --host <host>` first and
+  follow what it already knows. Skipping it means repeating exploration the user already paid for.
+- **Never explore to learn.** Only record what the task itself revealed. Do not click through extra
+  pages, open unrelated flows, or probe a site to fill in memory.
+- **Learning never fails the task.** These commands are advisory. If one fails, report it in one
+  line and continue the user's actual goal. Do not retry it and do not let it block the task.
+
+### Record the task you are already doing
+
+To leave memory behind for a site you are working on right now, record your own run — no human
+click-through, no second pass:
+
+```sh
+bsk record start --detach --url <start-url> --output ./rec --json   # prints session_id + tab_id
+bsk observe --session <id>                                          # then do the real task
+bsk fill @e4 --value "珠穆朗玛峰" --session <id>
+bsk press Enter --session <id>
+bsk record stop --output ./rec                                      # exports trace.json + states/
+bsk site workflow save --from ./rec/trace.json --id <id> --task <task-id>
+bsk site checkpoint --host <host> --task <task-id> --reason direct_correction
+```
+
+`--detach` returns as soon as recording is armed instead of blocking until the user clicks 结束, so
+the session's busy gate stays free and your own commands are accepted. Without it `record start`
+holds the session and every `observe/fill/click` comes back `session_busy`. Your CDP-driven actions
+land in the bundle exactly like a human's.
+
+`record stop` also ends the recording session, so there is nothing left to stop afterwards. For an
+ordinary (unrecorded) session the id is a positional argument: `bsk session stop <id>`, not
+`--session <id>`. Reusing a workflow later needs no recording at all — read it, run it, then
+`bsk site workflow verify <id> --host <host> --pass`, which also clears NEEDS REVIEW.
+
+Record only the task itself. Do not click extra pages, open unrelated flows, or take a detour to
+make the recording "more complete" — a workflow derived from exploration teaches the next agent to
+explore too. If the run goes wrong, `bsk record stop` still exports what happened; just do not save
+a workflow from it.
+
+`workflow save` writes into a per-task draft; `checkpoint` publishes it and takes an
+`--expected-revision`. The revision counter is per host, so another site's checkpoint never
+disturbs your draft. A `conflict` result means another writer committed first on *this* host.
+Recover by re-running `bsk site context --host <host> --task <task-id>`: it re-seeds the draft's
+`SITE.md` and `references/` from the published revision, which means **your own edits are gone
+from the draft and must be replayed** on top of what you now read before you checkpoint again.
+Workflows you staged in the draft are kept. The output says `draft.rebased: true` and carries a
+one-line `hint` when this happened. Retry a conflict only once.
+
+`context --task <id>` also lists the workflows staged in that draft, marked `"draft": true` — a
+workflow you just saved is readable before it is published.
+
+Recorded field values are never stored: `workflow save` turns each `fill` value into a named
+parameter, so a saved workflow says which field to fill, not what the user typed. Pass
+`--inline-values` only when the typed values belong to the flow rather than to the person who
+recorded it. A `<select>` is different: its option `value` is a constant the site defines, so it
+is kept inline and needs no parameter. Every host that looks like a banking, SSO, or
+password-manager surface is refused by all of these commands.
 
 ## Recover without wandering
 
