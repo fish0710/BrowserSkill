@@ -13,7 +13,7 @@
 ```sh
 git clone https://github.com/fish0710/BrowserSkill.git
 cd BrowserSkill
-git checkout release               # 发行分支：upstream main + 人类接管回路 + 站点记忆
+git checkout fork-release          # 发行分支：upstream main + 人类接管回路 + 站点记忆
 ```
 
 ## 2. 构建并安装 CLI
