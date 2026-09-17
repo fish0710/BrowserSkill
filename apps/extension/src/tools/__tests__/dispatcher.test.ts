@@ -1331,6 +1331,155 @@ describe("ToolDispatcher", () => {
     );
   });
 
+  it("rearms a lost hover and retries the work once when the target is not visible", async () => {
+    vi.stubGlobal("chrome", {
+      tabs: { sendMessage: vi.fn(async () => undefined) },
+    });
+    const { transport } = fakeTransport();
+    const sessions = new SessionManager({
+      agentWindow: {
+        create: vi.fn(async () => 1),
+        remove: vi.fn(async () => {}),
+        ensureActiveTab: vi.fn(async () => 1),
+      },
+    });
+    const moves: Array<{ x: number; y: number }> = [];
+    const cdp = {
+      send: vi.fn(async (_tabId: number, method: string, params?: object) => {
+        if (method === "Input.dispatchMouseEvent") {
+          const p = params as { x: number; y: number };
+          moves.push({ x: p.x, y: p.y });
+        }
+        return {};
+      }),
+      detachSession: vi.fn(async () => {}),
+      ensureNetworkCapture: vi.fn(async () => {}),
+      networkEntriesSince: vi.fn(() => ({
+        tab_id: 7,
+        entries: [],
+        next_since: 0,
+        truncated: false,
+      })),
+      setDeviceMetricsOverride: vi.fn(async () => {}),
+      clearDeviceMetricsOverride: vi.fn(async () => {}),
+      setUserAgentOverride: vi.fn(async () => {}),
+      setTouchEmulationEnabled: vi.fn(async () => {}),
+    };
+    const dispatcher = new ToolDispatcher({ transport, sessions, cdp: cdp as TestDispatcherCdp });
+    const helpers = dispatcher as unknown as {
+      rememberHover: (sessionId: string, result: unknown) => unknown;
+      withHoverReassert: <T>(
+        params: { session_id: string; tab_id?: number },
+        work: (scope: { preserveHover: boolean }) => Promise<T>,
+      ) => Promise<T>;
+    };
+    helpers.rememberHover("aa11", { tab_id: 7, x: 60, y: 40 });
+
+    const invisible = {
+      code: "permission_denied",
+      message: "element not visible",
+      data: { reason: "element_not_visible" },
+    };
+    const calls: Array<{ preserveHover: boolean }> = [];
+    const result = await helpers.withHoverReassert(
+      { session_id: "aa11", tab_id: 7 },
+      async (scope) => {
+        calls.push(scope);
+        return calls.length === 1 ? invisible : { tab_id: 7, x: 60, y: 40 };
+      },
+    );
+
+    // The invisible result is retried once under a re-armed hover, and the
+    // caller is told to preserve that hover while it measures geometry.
+    expect(calls).toEqual([{ preserveHover: true }, { preserveHover: true }]);
+    expect(result).toMatchObject({ tab_id: 7 });
+
+    // A genuine re-arm is a leave-then-return transition: a same-point move
+    // cannot re-fire mouseenter on the page. The routine reassert comes first,
+    // then the re-arm pair.
+    expect(moves).toEqual([
+      { x: 60, y: 40 },
+      { x: -10, y: -10 },
+      { x: 60, y: 40 },
+    ]);
+  });
+
+  it("does not rearm or retry a failure that is unrelated to hover visibility", async () => {
+    vi.stubGlobal("chrome", { tabs: { sendMessage: vi.fn(async () => undefined) } });
+    const { transport } = fakeTransport();
+    const sessions = new SessionManager({
+      agentWindow: {
+        create: vi.fn(async () => 1),
+        remove: vi.fn(async () => {}),
+        ensureActiveTab: vi.fn(async () => 1),
+      },
+    });
+    const cdp = {
+      send: vi.fn(async () => ({})),
+      detachSession: vi.fn(async () => {}),
+      ensureNetworkCapture: vi.fn(async () => {}),
+      networkEntriesSince: vi.fn(() => ({
+        tab_id: 7,
+        entries: [],
+        next_since: 0,
+        truncated: false,
+      })),
+      setDeviceMetricsOverride: vi.fn(async () => {}),
+      clearDeviceMetricsOverride: vi.fn(async () => {}),
+      setUserAgentOverride: vi.fn(async () => {}),
+      setTouchEmulationEnabled: vi.fn(async () => {}),
+    };
+    const dispatcher = new ToolDispatcher({ transport, sessions, cdp: cdp as TestDispatcherCdp });
+    const helpers = dispatcher as unknown as {
+      rememberHover: (sessionId: string, result: unknown) => unknown;
+      withHoverReassert: <T>(
+        params: { session_id: string; tab_id?: number },
+        work: (scope: { preserveHover: boolean }) => Promise<T>,
+      ) => Promise<T>;
+    };
+    helpers.rememberHover("aa11", { tab_id: 7, x: 60, y: 40 });
+
+    const notFound = { code: "not_found", message: "ref_not_found" };
+    let runs = 0;
+    const result = await helpers.withHoverReassert({ session_id: "aa11", tab_id: 7 }, async () => {
+      runs += 1;
+      return notFound;
+    });
+
+    expect(result).toEqual(notFound);
+    // Exactly one attempt: the retry is reserved for hover-revealed targets.
+    expect(runs).toBe(1);
+    // Only the routine reassert ran; no leave-and-return re-arm.
+    expect(cdp.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks work as hover-preserving only while a latch applies", async () => {
+    vi.stubGlobal("chrome", { tabs: { sendMessage: vi.fn(async () => undefined) } });
+    const { transport } = fakeTransport();
+    const sessions = new SessionManager({
+      agentWindow: {
+        create: vi.fn(async () => 1),
+        remove: vi.fn(async () => {}),
+        ensureActiveTab: vi.fn(async () => 1),
+      },
+    });
+    const dispatcher = new ToolDispatcher({ transport, sessions });
+    const helpers = dispatcher as unknown as {
+      withHoverReassert: <T>(
+        params: { session_id: string; tab_id?: number },
+        work: (scope: { preserveHover: boolean }) => Promise<T>,
+      ) => Promise<T>;
+    };
+
+    // No latch for this tab: nothing to preserve, so the work keeps the plain
+    // scroll-into-view behaviour.
+    const withoutLatch = await helpers.withHoverReassert(
+      { session_id: "aa11", tab_id: 7 },
+      async (scope) => scope,
+    );
+    expect(withoutLatch).toEqual({ preserveHover: false });
+  });
+
   it("disconnects the transport when send() fails so keepalive can rebuild", async () => {
     const { transport, deliver } = fakeTransport();
     const sessions = new SessionManager({

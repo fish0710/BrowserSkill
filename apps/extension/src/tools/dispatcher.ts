@@ -6,6 +6,7 @@ import {
 import { type CursorVisualizer, createCursorVisualizer } from "@/lib/cursor-bridge";
 import type { InteractionPreferenceStore } from "@/lib/interaction-preferences";
 import { OVERLAY_AUTOMATION_BYPASS } from "@/lib/overlay-bridge";
+import { clearPointer, recordPointer } from "@/lib/pointer-state";
 import { ScreenshotExports } from "@/long-screenshot/exports";
 import type { SessionManager } from "@/session-manager/manager";
 import type { Transport } from "@/transport/transport";
@@ -127,6 +128,42 @@ interface HoverLatch {
   tabId: number;
   x: number;
   y: number;
+}
+
+/**
+ * Point used to genuinely *leave* a hovered element before returning to it.
+ *
+ * Chrome only fires `mouseenter`/`mouseover` on an outside→inside transition.
+ * Re-dispatching `mouseMoved` where the pointer already is, is a no-op, so it
+ * cannot restore a hover the page dropped on its own (a re-render, or a probe
+ * that parked the pointer). Leaving to a point outside every element and coming
+ * back is the only reliable re-arm.
+ *
+ * Deliberately only used as a *recovery* step, never as the routine reassert: a
+ * menu opened by a click that reopens only on `mouseenter` would be destroyed
+ * by an unconditional leave-and-return.
+ */
+const HOVER_REARM_LEAVE_POINT = { x: -10, y: -10 };
+
+/**
+ * Settle window after re-arming a hover, before the caller resolves geometry
+ * again. Menus commonly open on the next animation frame, so the re-opened
+ * element does not exist yet at the instant the pointer returns.
+ */
+const HOVER_REARM_SETTLE_MS = 60;
+
+/** Resolving a hover-revealed target can legitimately fail once, before re-arming. */
+function isElementNotVisible(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as RpcError).code === "permission_denied" &&
+    (error as RpcError).data?.reason === "element_not_visible"
+  );
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 interface HoverLatchScope {
@@ -575,7 +612,7 @@ export class ToolDispatcher {
       case "tool.click":
         return this.withHoverReassert(
           req.params as ClickParams,
-          () =>
+          ({ preserveHover }) =>
             handleClick(
               this.sessions,
               req.params as ClickParams,
@@ -586,6 +623,7 @@ export class ToolDispatcher {
                     signal,
                     bypassOverlay,
                     cursor: this.cursor,
+                    preserveHover,
                   }
                 : undefined,
             ),
@@ -817,9 +855,19 @@ export class ToolDispatcher {
     return this.hoverLatchesForRequest(scope).length > 0;
   }
 
+  /**
+   * Re-assert any remembered hover before running `work`, and hand the work a
+   * scope describing whether a hover latch applies to it.
+   *
+   * `preserveHover` is true when the caller's target may exist only because the
+   * agent is holding a hover, so the work must not gratuitously scroll the page
+   * (see {@link InteractionDeps.preserveHover}). When the work fails with
+   * `element_not_visible` under a latch, the latch is re-armed by a real
+   * leave-and-return transition and the work is retried exactly once.
+   */
   private async withHoverReassert<T>(
     params: { session_id: string; tab_id?: number },
-    work: () => Promise<T>,
+    work: (scope: { preserveHover: boolean }) => Promise<T>,
     options: { releaseAfter?: boolean } = {},
     signal?: AbortSignal,
   ): Promise<T> {
@@ -828,13 +876,64 @@ export class ToolDispatcher {
     throwIfDispatchAborted(signal);
     await this.reassertHover(scope);
     throwIfDispatchAborted(signal);
+    // A latched hover is what keeps a hover-revealed menu open, so while one
+    // applies the work must not gratuitously scroll the page out from under it.
+    const preserveHover = this.hasHoverLatchForScope(scope);
     try {
-      return await work();
+      const first = await work({ preserveHover });
+      // If the hover was lost meanwhile — a probe parked the pointer, or an
+      // intervening scroll dismissed the menu — the target resolves as having no
+      // visible geometry. Re-arming is a real transition (leave, then return),
+      // so it can genuinely reopen the menu; a same-point move cannot. Bound it
+      // to one retry so a target that is invisible for an unrelated reason still
+      // fails fast with its original error.
+      if (!preserveHover || !isElementNotVisible(first)) return first;
+      throwIfDispatchAborted(signal);
+      if (!(await this.rearmHover(scope))) return first;
+      throwIfDispatchAborted(signal);
+      return await work({ preserveHover });
     } finally {
       if (options.releaseAfter) {
         await this.releaseHoverLatch(scope.session_id, scope.tab_id);
       }
     }
+  }
+
+  /**
+   * Re-establish every latched hover by leaving the element and returning to
+   * it, then let the re-opened UI settle.
+   *
+   * Returns whether at least one latch was re-armed. See
+   * {@link HOVER_REARM_LEAVE_POINT} for why a same-point `mouseMoved` is not
+   * enough.
+   */
+  private async rearmHover(params: { session_id: string; tab_id?: number }): Promise<boolean> {
+    if (!this.cdp) return false;
+    const latches = this.hoverLatchesForRequest(params);
+    if (latches.length === 0) return false;
+    let rearmed = false;
+    await Promise.all(
+      latches.map(async (latch) => {
+        try {
+          await this.cdp!.send(latch.tabId, "Input.dispatchMouseEvent", {
+            type: "mouseMoved",
+            ...HOVER_REARM_LEAVE_POINT,
+          });
+          await this.cdp!.send(latch.tabId, "Input.dispatchMouseEvent", {
+            type: "mouseMoved",
+            x: latch.x,
+            y: latch.y,
+          });
+          recordPointer(latch.tabId, { x: latch.x, y: latch.y });
+          rearmed = true;
+        } catch (err) {
+          console.debug("[bsk dispatcher] hover re-arm failed", err);
+          this.hoverLatches.delete(latch.tabId);
+        }
+      }),
+    );
+    if (rearmed) await delayMs(HOVER_REARM_SETTLE_MS);
+    return rearmed;
   }
 
   private async withHoverReleaseForRequest<T>(
@@ -955,6 +1054,9 @@ export class ToolDispatcher {
       tabs.add(latch.tabId);
       this.hoverLatches.delete(latch.tabId);
     }
+    // The pointer memory is per tab and dies with the agent's ownership of it,
+    // so a later session cannot restore a hover into a tab it does not hold.
+    for (const released of tabs) clearPointer(released);
     await Promise.all([...tabs].map((tabId) => bypassOverlay(tabId, false)));
   }
 }

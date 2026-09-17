@@ -1,3 +1,4 @@
+import { lastPointer, recordPointer } from "@/lib/pointer-state";
 import type { CdpRunner } from "../shared";
 
 function abortError(): Error {
@@ -22,18 +23,65 @@ export async function waitForHover(ms: number, signal?: AbortSignal): Promise<vo
   });
 }
 
+/** Point a probe parks the pointer on when nothing else is known. */
+export const PARKED_POINTER: { x: number; y: number } = { x: -10, y: -10 };
+
+/**
+ * How long to wait after restoring the pointer for an async (`rAF`-driven)
+ * hover menu to open before the caller measures the page again.
+ */
+const HOVER_RESTORE_SETTLE_MS = 60;
+
+async function dispatchMove(cdp: CdpRunner, tabId: number, point: { x: number; y: number }) {
+  return cdp.send(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: point.x,
+    y: point.y,
+  });
+}
+
+/**
+ * Park the real pointer away from the page so a probe starts from a known
+ * hover-free baseline.
+ *
+ * Probing has to move the real CDP pointer, which necessarily disturbs whatever
+ * the caller had hovered. {@link restoreHoverPointer} undoes that afterwards.
+ * Deliberately does *not* touch the remembered pointer position: the probe's
+ * parking spot is not an agent action, and a later restore must still know
+ * where the agent last legitimately put the pointer.
+ */
 export async function clearHover(cdp: CdpRunner, tabId: number): Promise<void> {
-  await cdp
-    .send(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: -10,
-      y: -10,
-    })
-    .catch(() =>
-      cdp.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: 0, y: 0 }).catch(() => {
-        // Best effort cleanup.
-      }),
-    );
+  await dispatchMove(cdp, tabId, PARKED_POINTER).catch(() =>
+    dispatchMove(cdp, tabId, { x: 0, y: 0 }).catch(() => {
+      // Best effort cleanup.
+    }),
+  );
+}
+
+/**
+ * Put the pointer back where it was before a probe, and let the page settle.
+ *
+ * Because `clearHover` parked the pointer elsewhere, the move back is a real
+ * hover transition (Chrome only fires `mouseenter` when the pointer *enters*),
+ * so a menu the agent had opened is re-established rather than silently lost.
+ * With no remembered position there is nothing to restore and the pointer stays
+ * parked, which is the previous behaviour.
+ */
+export async function restoreHoverPointer(
+  cdp: CdpRunner,
+  tabId: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const previous = lastPointer(tabId);
+  if (!previous) return;
+  await dispatchMove(cdp, tabId, previous).catch((err) => {
+    console.debug("[bsk hover] pointer restore failed", err);
+  });
+  recordPointer(tabId, previous);
+  if (signal?.aborted) return;
+  await waitForHover(HOVER_RESTORE_SETTLE_MS, signal).catch(() => {
+    // Cancellation must not turn a cosmetic restore into a probe failure.
+  });
 }
 
 /**

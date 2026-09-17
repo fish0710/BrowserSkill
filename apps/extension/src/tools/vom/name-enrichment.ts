@@ -1,7 +1,7 @@
 import { isVomReferenceNode } from "@browser-skill/vom";
 import { type CdpRunner, sendToCdpTarget } from "../shared";
 import type { FrameDocument, FrameOwnedAxNode } from "./frame-document";
-import { clearHover, ProbeBudget, waitForHover } from "./hover-perception";
+import { clearHover, ProbeBudget, restoreHoverPointer, waitForHover } from "./hover-perception";
 import { stableIdentifierName } from "./semantic-graph/name-evidence";
 import { frameBackendKey, type ResolvedSemanticGraph } from "./semantic-graph/types";
 
@@ -261,6 +261,9 @@ export async function probeTooltipNames<T extends FrameOwnedAxNode>(
 
   const budget = new ProbeBudget(MAX_TOOLTIP_PROBE_MS);
   const contexts = new Map<string, number>();
+  // The tooltip probe physically moves the real pointer; remember that so the
+  // agent's own hover can be put back once the phase is over.
+  let pointerDisturbed = false;
   try {
     for (const candidate of pending) {
       if (options.signal?.aborted) throw new DOMException("observation aborted", "AbortError");
@@ -280,6 +283,7 @@ export async function probeTooltipNames<T extends FrameOwnedAxNode>(
           candidate.backendNodeId,
         );
         if (!objectId) continue;
+        pointerDisturbed = true;
         await clearHover(cdp, tabId);
         const before = await tooltipTexts(cdp, candidate.document, objectId);
         await cdp.send(tabId, "Input.dispatchMouseEvent", {
@@ -297,11 +301,17 @@ export async function probeTooltipNames<T extends FrameOwnedAxNode>(
         if (error instanceof Error && error.name === "AbortError") throw error;
       } finally {
         if (objectId) await releaseObject(cdp, candidate.document, objectId);
+        // Park between candidates so each baseline starts hover-free; the outer
+        // `finally` restores the agent's own hover once probing is done.
         await clearHover(cdp, tabId);
       }
     }
   } finally {
-    await clearHover(cdp, tabId);
+    if (pointerDisturbed && !options.signal?.aborted) {
+      await restoreHoverPointer(cdp, tabId, options.signal);
+    } else {
+      await clearHover(cdp, tabId);
+    }
   }
   return names;
 }

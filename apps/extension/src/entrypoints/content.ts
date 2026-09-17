@@ -5,8 +5,9 @@ import { flushSync } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { BorrowConfirmationOverlay } from "@/content/BorrowConfirmationOverlay";
 import { ControlOverlay } from "@/content/ControlOverlay";
-import { CursorOverlay, type CursorState } from "@/content/CursorOverlay";
+import { CursorOverlay } from "@/content/CursorOverlay";
 import { createCaptureSuppressController } from "@/content/capture-suppress";
+import { CursorLifecycle, cursorYieldsToOverlay } from "@/content/cursor-lifecycle";
 import { HelpRequestOverlay } from "@/content/HelpRequestOverlay";
 import { createHelpRequestData } from "@/content/help-request";
 import overlayCss from "@/content/overlay.css?inline";
@@ -92,7 +93,9 @@ export default defineContentScript({
     let overlayHost: HTMLElement | null = null;
     let overlayContainer: HTMLElement | null = null;
     let activeAgentState: OverlayAgentStateMessage | null = null;
-    let cursorState: CursorState | null = null;
+    // Owns the cosmetic cursor's position and visibility rules; see
+    // cursor-lifecycle.ts for the table of overlay mode -> cursor state.
+    const cursor = new CursorLifecycle();
     let actionStatus: { tool: string; target?: string } | null = null;
     let cursorRippleId = 0;
     let hostLossReported = false;
@@ -214,7 +217,7 @@ export default defineContentScript({
               }),
               React.createElement(HelpRequestOverlay, { request: overlayState.activeHelp }),
               React.createElement(RecordOverlay, { request: overlayState.activeRecord }),
-              React.createElement(CursorOverlay, { state: cursorState }),
+              React.createElement(CursorOverlay, { state: cursor.snapshot() }),
               React.createElement(ControlOverlay, {
                 visible:
                   controlOverlayVisible || interruptingOverlayVisible || overlayState.pausedVisible,
@@ -249,10 +252,11 @@ export default defineContentScript({
     function applyOverlayState(state: OverlayAgentStateMessage): void {
       activeAgentState = state;
       overlays.applyAgentControlMode(state.sessionId, state.mode);
-      // A session that is no longer in control cannot be driving input, so a
-      // lingering cosmetic cursor would be stale.
-      if (!overlays.isControlVisible() && !overlays.isPausedVisible()) {
-        cursorState = null;
+      // Hand the cursor its ownership rules: a paused tab or an ended session
+      // hides the arrow (keeping its position for a later restore), while an
+      // agent in control — or a take-over still in flight — keeps it visible.
+      cursor.applyOverlayMode(state.mode, state.sessionId);
+      if (cursorYieldsToOverlay(state.mode, state.sessionId)) {
         actionStatus = null;
       }
       renderAll();
@@ -264,7 +268,9 @@ export default defineContentScript({
         void sendHelpFinish(previousHelp.id, "cancelled");
       }
       activeRecordRequestId = null;
-      cursorState = null;
+      // This document is no longer an agent session's; drop the position so
+      // nothing can be restored into a later session.
+      cursor.clear();
       actionStatus = null;
       renderAll();
     }
@@ -278,25 +284,27 @@ export default defineContentScript({
     function handleCursorMessage(message: CursorMessage): void {
       switch (message.action) {
         case "move":
-          cursorState = {
+          cursor.point({
             x: message.x,
             y: message.y,
             durationMs: message.durationMs,
             ...(message.label ? { label: message.label } : {}),
-          };
+          });
           break;
-        case "click":
+        case "click": {
+          const previous = cursor.snapshot();
           cursorRippleId += 1;
-          cursorState = {
+          cursor.point({
             x: message.x,
             y: message.y,
-            durationMs: cursorState?.durationMs ?? 0,
-            ...(cursorState?.label ? { label: cursorState.label } : {}),
+            durationMs: previous?.durationMs ?? 0,
+            ...(previous?.label ? { label: previous.label } : {}),
             ripple: { id: cursorRippleId, button: message.button ?? "left" },
-          };
+          });
           break;
+        }
         case "hide":
-          cursorState = null;
+          cursor.clear();
           break;
       }
       renderAll();

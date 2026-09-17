@@ -1,5 +1,3 @@
-import { useEffect, useState } from "react";
-
 /**
  * Cosmetic in-page agent cursor. Rendered by the content script inside the
  * existing `browser-skill-overlay` shadow tree, so it inherits the host's
@@ -8,9 +6,13 @@ import { useEffect, useState } from "react";
  *
  * The background sends one {@link CursorState} per action: `move` glides the
  * arrow to the target before the real CDP event fires, `click` adds a ripple
- * at the same point. When the agent goes quiet for
- * {@link IDLE_HIDE_MS} the cursor fades out; a `null` state (session reset /
- * explicit hide) removes it immediately.
+ * at the same point. The cursor is *not* hidden on idle: while an agent session
+ * owns the tab the arrow stays where the last action left it, so a human
+ * watching between two tool calls can still see where the agent is. Only an
+ * explicit `null` state removes it — session end, page navigation (the content
+ * script is rebuilt), tab return, or the user taking over. Because it is
+ * cosmetic and lives in the overlay host, screenshots stay clean via the
+ * host-level capture suppression rather than by hiding the cursor itself.
  */
 
 export interface CursorRipple {
@@ -33,8 +35,6 @@ export interface CursorOverlayProps {
   state: CursorState | null;
 }
 
-const IDLE_HIDE_MS = 2500;
-const FADE_MS = 300;
 const RIPPLE_MS = 400;
 const RIPPLE_SIZE_PX = 40;
 const MAX_LABEL_CHARS = 40;
@@ -50,17 +50,8 @@ function truncateLabel(label: string): string {
 }
 
 export function CursorOverlay({ state }: CursorOverlayProps) {
-  const [visible, setVisible] = useState(true);
-
-  // `state` is a fresh object per bridge message, so the idle timer restarts
-  // on every move/click.
-  useEffect(() => {
-    if (!state) return;
-    setVisible(true);
-    const timer = window.setTimeout(() => setVisible(false), IDLE_HIDE_MS);
-    return () => window.clearTimeout(timer);
-  }, [state]);
-
+  // The cursor stays visible for as long as `state` is non-null. Idle time
+  // between tool calls must not hide it: only an explicit `null` state does.
   if (!state) return null;
 
   const ripple = state.ripple;
@@ -74,12 +65,12 @@ export function CursorOverlay({ state }: CursorOverlayProps) {
         top: 0,
         zIndex: 2147483647,
         pointerEvents: "none",
-        opacity: visible ? 1 : 0,
         transform: `translate3d(${state.x}px, ${state.y}px, 0)`,
-        // Two independent transitions on one element: the glide and the
-        // fade after the agent goes idle.
-        transition: `transform ${Math.max(state.durationMs, 0)}ms cubic-bezier(0.22, 1, 0.36, 1), opacity ${FADE_MS}ms ease-out`,
-        willChange: "transform, opacity",
+        // The glide animates the arrow towards the point the real CDP pointer
+        // was already placed on (see `moveCursor` in tools/interaction.ts), so
+        // the arrow and the live page hover state stay in step.
+        transition: `transform ${Math.max(state.durationMs, 0)}ms cubic-bezier(0.22, 1, 0.36, 1)`,
+        willChange: "transform",
       }}
     >
       <style>{`

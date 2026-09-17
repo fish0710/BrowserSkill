@@ -1400,6 +1400,46 @@ describe("cosmetic cursor wiring", () => {
     expect(cursor.click).not.toHaveBeenCalled();
   });
 
+  it("places the real pointer on the destination before the arrow glides there", async () => {
+    const order: string[] = [];
+    const cursor = fakeCursor();
+    cursor.move.mockImplementation(async () => {
+      order.push("cursor-glide");
+    });
+    const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
+    const ctx = await sm.start("aa11");
+    ctx.refStore.set("e3", 1234, { tabId: 4 });
+    const fake = makeFakeCdp({
+      "DOM.scrollIntoViewIfNeeded": () => ({}),
+      "DOM.getContentQuads": () => ({ quads: [[10, 20, 110, 20, 110, 60, 10, 60]] }),
+      "Input.dispatchMouseEvent": () => {
+        order.push("mouse");
+        return {};
+      },
+    });
+    const deps = { cdp: fake.cdp, tabsApi: fake.tabsApi, cursor };
+
+    // First action establishes a previous cursor position, so the second one
+    // has a real distance to glide over.
+    await handleClick(sm, { session_id: "aa11", ref: "@e3" }, deps);
+    order.length = 0;
+    await handleClick(sm, { session_id: "aa11", ref: "@e3" }, deps);
+
+    // The real CDP pointer must be placed before the arrow animates: otherwise
+    // the arrow arrives at a point the page was never told about.
+    expect(order[0]).toBe("mouse");
+    expect(order[1]).toBe("cursor-glide");
+
+    // ...and both finish on the same viewport point.
+    const mouseMoves = fake.sent.filter(
+      (call) =>
+        call.method === "Input.dispatchMouseEvent" &&
+        (call.params as { type?: string }).type === "mouseMoved",
+    );
+    const lastMouse = mouseMoves.at(-1)?.params as { x: number; y: number };
+    expect(cursor.move.mock.calls.at(-1)?.[1]).toEqual({ x: lastMouse.x, y: lastMouse.y });
+  });
+
   it("does not move the cursor when the signal aborts during the glide", async () => {
     const abort = new AbortController();
     const cursor = fakeCursor();
@@ -1450,5 +1490,96 @@ describe("cosmetic cursor wiring", () => {
       { x: 25, y: 25 },
       expect.objectContaining({ label: ".btn-go" }),
     );
+  });
+});
+
+describe("hover-preserving geometry resolution", () => {
+  afterEach(() => {
+    __testing__.clearCursorPositions();
+  });
+
+  /**
+   * Scrolling before measuring is what closes a hover-revealed menu: the page
+   * dismisses it on scroll, the menuitem detaches, and the target then has no
+   * geometry. Under a held hover the geometry must therefore be measured in
+   * place whenever that succeeds.
+   */
+  it("measures a hover-revealed target in place instead of scrolling the page", async () => {
+    const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
+    const ctx = await sm.start("aa11");
+    ctx.refStore.set("e3", 1234, { tabId: 4 });
+    const fake = makeFakeCdp({
+      "DOM.scrollIntoViewIfNeeded": () => ({}),
+      "DOM.getContentQuads": () => ({ quads: [[10, 20, 110, 20, 110, 60, 10, 60]] }),
+      "Input.dispatchMouseEvent": () => ({}),
+    });
+
+    const res = await handleClick(
+      sm,
+      { session_id: "aa11", ref: "@e3" },
+      { cdp: fake.cdp, tabsApi: fake.tabsApi, preserveHover: true },
+    );
+
+    if ("code" in res) throw new Error(`unexpected error: ${JSON.stringify(res)}`);
+    expect(res).toMatchObject({ x: 60, y: 40 });
+    // The destructive scroll never ran.
+    expect(fake.sent.some((call) => call.method === "DOM.scrollIntoViewIfNeeded")).toBe(false);
+  });
+
+  it("still scrolls a target that has no geometry where it sits", async () => {
+    const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
+    const ctx = await sm.start("aa11");
+    ctx.refStore.set("e3", 1234, { tabId: 4 });
+    let scrolled = false;
+    const fake = makeFakeCdp({
+      "DOM.scrollIntoViewIfNeeded": () => {
+        scrolled = true;
+        return {};
+      },
+      // Off-screen until the scroll happens, then measurable: the fallback path
+      // must still bring it into view rather than reporting a dead target.
+      "DOM.getContentQuads": () =>
+        scrolled ? { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] } : { quads: [] },
+      "DOM.getBoxModel": () => {
+        throw new Error("Could not compute box model.");
+      },
+      "Input.dispatchMouseEvent": () => ({}),
+    });
+
+    const res = await handleClick(
+      sm,
+      { session_id: "aa11", ref: "@e3" },
+      { cdp: fake.cdp, tabsApi: fake.tabsApi, preserveHover: true },
+    );
+
+    if ("code" in res) throw new Error(`unexpected error: ${JSON.stringify(res)}`);
+    expect(scrolled).toBe(true);
+    expect(res).toMatchObject({ x: 60, y: 40 });
+  });
+
+  it("keeps the original scroll-first order when no hover is held", async () => {
+    const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
+    const ctx = await sm.start("aa11");
+    ctx.refStore.set("e3", 1234, { tabId: 4 });
+    const order: string[] = [];
+    const fake = makeFakeCdp({
+      "DOM.scrollIntoViewIfNeeded": () => {
+        order.push("scroll");
+        return {};
+      },
+      "DOM.getContentQuads": () => {
+        order.push("quads");
+        return { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] };
+      },
+      "Input.dispatchMouseEvent": () => ({}),
+    });
+
+    await handleClick(
+      sm,
+      { session_id: "aa11", ref: "@e3" },
+      { cdp: fake.cdp, tabsApi: fake.tabsApi },
+    );
+
+    expect(order).toEqual(["scroll", "quads"]);
   });
 });

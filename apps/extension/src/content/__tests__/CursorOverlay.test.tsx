@@ -53,25 +53,35 @@ describe("CursorOverlay", () => {
     expect(container.querySelector("[data-slot='agent-cursor']")).toBeNull();
   });
 
-  it("fades out after the idle window and comes back on the next move", () => {
+  it("stays visible while the agent is idle and only disappears on a null state", () => {
     vi.useFakeTimers();
     const { container, rerender } = render(<CursorOverlay state={{ x: 1, y: 2, durationMs: 0 }} />);
 
     const cursor = container.querySelector("[data-slot='agent-cursor']") as HTMLElement;
-    expect(cursor.style.opacity).toBe("1");
+    expect(cursor).toBeTruthy();
+    // No opacity animation: the arrow is not faded out on idle.
+    expect(cursor.style.opacity).toBe("");
 
     act(() => {
-      vi.advanceTimersByTime(2600);
+      // A long idle window between two tool calls must not hide the cursor: a
+      // human watching the Agent Window still needs to see where the agent is.
+      vi.advanceTimersByTime(60_000);
     });
-    expect(
-      (container.querySelector("[data-slot='agent-cursor']") as HTMLElement).style.opacity,
-    ).toBe("0");
+    expect(container.querySelector("[data-slot='agent-cursor']")).toBe(cursor);
 
+    // The next action moves the same node instead of remounting it.
     act(() => {
-      rerender(<CursorOverlay state={{ x: 3, y: 4, durationMs: 0 }} />);
+      rerender(<CursorOverlay state={{ x: 30, y: 40, durationMs: 0 }} />);
     });
-    expect(
-      (container.querySelector("[data-slot='agent-cursor']") as HTMLElement).style.opacity,
-    ).toBe("1");
+    const moved = container.querySelector("[data-slot='agent-cursor']") as HTMLElement;
+    expect(moved).toBe(cursor);
+    expect(moved.style.transform).toContain("30px");
+
+    // Only an explicit null state (session end, tab return, user takeover,
+    // page navigation) removes it.
+    act(() => {
+      rerender(<CursorOverlay state={null} />);
+    });
+    expect(container.querySelector("[data-slot='agent-cursor']")).toBeNull();
   });
 });

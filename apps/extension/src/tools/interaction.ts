@@ -20,6 +20,7 @@ import {
   createCursorVisualizer,
   cursorMoveDuration,
 } from "@/lib/cursor-bridge";
+import { recordPointer } from "@/lib/pointer-state";
 import type { SessionContext, SessionManager } from "@/session-manager/manager";
 import type {
   BlurParams,
@@ -43,7 +44,12 @@ import type {
 import { attachDialogs, markDialogCursor } from "./dialogs";
 import { backendNodeToObject } from "./element-geometry";
 import { rpcError } from "./errors";
-import { resolveNodeGeometry, scrollElementAndFramesIntoView } from "./frame-geometry";
+import {
+  type NodeAddress,
+  type ResolvedNodeGeometry,
+  resolveNodeGeometry,
+  scrollElementAndFramesIntoView,
+} from "./frame-geometry";
 import {
   type CdpRunner,
   type ChromeTabsApi,
@@ -67,6 +73,12 @@ export interface InteractionDeps {
   bypassOverlay?: (tabId: number, enabled: boolean) => Promise<void>;
   /** Keep hover hit-testing active for the caller's next observation/action. */
   keepOverlayBypassAfterHover?: boolean;
+  /**
+   * The caller is deliberately holding a hover on this tab, so a hover-revealed
+   * target must not be disturbed by a gratuitous scroll while its geometry is
+   * measured. Set by the dispatcher for actions that run under a hover latch.
+   */
+  preserveHover?: boolean;
   /**
    * Cosmetic in-page cursor driven before the real CDP input fires. Optional
    * and never load-bearing: a missing visualizer (or a failing one) must leave
@@ -129,8 +141,23 @@ function cursorLabel(source: { usedRef?: string; usedSelector?: string }): strin
 
 /**
  * Glide the virtual cursor to `point` so a human watching the Agent Window
- * sees the action before it happens. Never throws and never changes the tool
- * result; the caller re-checks the abort signal right after this returns.
+ * sees the action before it happens, and keep the real CDP pointer and the
+ * arrow on the same destination.
+ *
+ * When the arrow actually animates (a known previous position and a non-zero
+ * glide), the real pointer is placed on `point` first and the arrow then glides
+ * to exactly that point. Otherwise the arrow teleports instantly and the
+ * caller's own `mouseMoved` lands the real pointer a moment later, so the two
+ * can never disagree: there is no window in which the arrow has arrived
+ * somewhere the real pointer has not been told about.
+ *
+ * The real pointer deliberately jumps straight to the destination instead of
+ * interpolating waypoints: a waypoint path would drag the pointer across
+ * whatever sits between the two elements, firing `mouseover`/`mouseleave` and
+ * closing the very hover-opened menu the caller is about to click.
+ *
+ * Never throws and never changes the tool result; the caller re-checks the
+ * abort signal right after this returns.
  */
 async function moveCursor(
   deps: InteractionDeps,
@@ -148,11 +175,75 @@ async function moveCursor(
     ...(attachmentId ? { attachmentId } : {}),
   });
   const durationMs = cursorMoveDuration(from, point);
+
+  // An animated glide would leave the arrow ahead of the page's real hover
+  // state, so lead with the real pointer. Best-effort: a failure here never
+  // changes the tool result.
+  if (durationMs > 0 && !deps.signal?.aborted) {
+    try {
+      await moveRealPointer(deps, tabId, point);
+    } catch (err) {
+      console.debug("[bsk interaction] real pointer move failed", err);
+    }
+    if (deps.signal?.aborted) return;
+  }
+
   try {
     await cursor.move(tabId, point, { durationMs, ...(label ? { label } : {}) });
   } catch (err) {
     console.debug("[bsk interaction] cursor move failed", err);
   }
+}
+
+/**
+ * Place the real CDP pointer on `point` and remember it. Used wherever the
+ * pointer moves without a click following, so the cosmetic cursor and the
+ * remembered position stay consistent with the live page.
+ */
+async function moveRealPointer(
+  deps: InteractionDeps,
+  tabId: number,
+  point: CursorPoint,
+  modifiers?: number,
+): Promise<void> {
+  await deps.cdp.send(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: point.x,
+    y: point.y,
+    ...(modifiers ? { modifiers } : {}),
+  });
+  recordPointer(tabId, point, deps.cdp.getAttachmentId?.(tabId));
+}
+
+/**
+ * Resolve action geometry for a target that may only be reachable because a
+ * hover latch is holding it open.
+ *
+ * `resolveNodeGeometry(..., { scrollIntoView: true })` scrolls *before* it
+ * measures. Many pages dismiss a hover menu on scroll, so measuring a menuitem
+ * that is already on screen can close the menu, detach the menuitem, and turn a
+ * perfectly clickable target into "target element has no visible geometry".
+ *
+ * When the caller is deliberately holding a hover ({@link InteractionDeps.preserveHover}),
+ * measure in place first: the returned regions are already clipped to the
+ * viewport, so a successful no-scroll pass is by construction a target that is
+ * clickable where it sits. Anything genuinely off-screen falls back to the
+ * original scroll-then-measure path, and callers that are not protecting a
+ * hover keep exactly the previous behaviour.
+ */
+async function resolveActionGeometry(
+  deps: InteractionDeps,
+  tabId: number,
+  address: NodeAddress,
+): Promise<ResolvedNodeGeometry | RpcError> {
+  // Whether an OOPIF node is on screen depends on its frame's projection rather
+  // than its own local quads, so those keep the original path.
+  if (!deps.preserveHover || address.frameId) {
+    return resolveNodeGeometry(deps.cdp, tabId, address, { scrollIntoView: true });
+  }
+  const inPlace = await resolveNodeGeometry(deps.cdp, tabId, address, { scrollIntoView: false });
+  if (!isRpcError(inPlace)) return inPlace;
+  return resolveNodeGeometry(deps.cdp, tabId, address, { scrollIntoView: true });
 }
 
 /** Fire-and-forget click ripple; cosmetic failures never surface. */
@@ -567,16 +658,11 @@ export async function clickResolvedTarget(
   }
 
   deps.cdp.trackSessionTab?.(ctx.sessionId, target.tabId);
-  const geometry = await resolveNodeGeometry(
-    deps.cdp,
-    target.tabId,
-    {
-      target: resolved.cdpTarget,
-      backendNodeId: resolved.backendNodeId,
-      ...(resolved.frameId ? { frameId: resolved.frameId } : {}),
-    },
-    { scrollIntoView: true },
-  );
+  const geometry = await resolveActionGeometry(deps, target.tabId, {
+    target: resolved.cdpTarget,
+    backendNodeId: resolved.backendNodeId,
+    ...(resolved.frameId ? { frameId: resolved.frameId } : {}),
+  });
   if (isRpcError(geometry)) return geometry;
   const centre = geometry.actionPoint;
 
@@ -670,6 +756,7 @@ async function dispatchClickAtPoint(
       ...point,
       modifiers,
     });
+    recordPointer(tabId, point, deps.cdp.getAttachmentId?.(tabId));
     if (beforePress) {
       const error = await beforePress();
       if (error) return failure(error);
@@ -807,16 +894,11 @@ export async function handleHover(
   if (isRpcError(node)) return node;
 
   deps.cdp.trackSessionTab?.(ctx.sessionId, target.tabId);
-  const geometry = await resolveNodeGeometry(
-    deps.cdp,
-    target.tabId,
-    {
-      target: node.cdpTarget,
-      backendNodeId: node.backendNodeId,
-      ...(node.frameId ? { frameId: node.frameId } : {}),
-    },
-    { scrollIntoView: true },
-  );
+  const geometry = await resolveActionGeometry(deps, target.tabId, {
+    target: node.cdpTarget,
+    backendNodeId: node.backendNodeId,
+    ...(node.frameId ? { frameId: node.frameId } : {}),
+  });
   if (isRpcError(geometry)) return geometry;
   const centre = geometry.actionPoint;
 
@@ -848,6 +930,9 @@ export async function handleHover(
       y: centre.y,
       modifiers,
     });
+    // Remember the held hover so a later perception probe can put the pointer
+    // back here instead of leaving the page hover-less.
+    recordPointer(target.tabId, centre, deps.cdp.getAttachmentId?.(target.tabId));
     const settleMs = params.settle_ms ?? DEFAULT_HOVER_SETTLE_MS;
     if (settleMs > 0) {
       await wait(settleMs, deps.signal);

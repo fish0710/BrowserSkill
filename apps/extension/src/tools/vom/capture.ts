@@ -12,7 +12,7 @@ export type {
 } from "./facts";
 
 import { isAbortError, throwIfAborted } from "./capture-abort";
-import { clearHover, ProbeBudget, waitForHover } from "./hover-perception";
+import { clearHover, ProbeBudget, restoreHoverPointer, waitForHover } from "./hover-perception";
 
 interface RuntimeEvaluateReply {
   result?: {
@@ -332,6 +332,10 @@ export async function probeHoverSurfaces(
   options: HoverSurfaceProbeOptions = {},
 ): Promise<CapturedSurfaceProbe[]> {
   const budget = new ProbeBudget(MAX_HOVER_PROBE_MS);
+  // Probing physically moves the real pointer, so whatever the agent had
+  // hovered is disturbed. Restore it once the whole phase finishes, whether it
+  // succeeded, bailed out early, or threw.
+  let pointerDisturbed = false;
   try {
     throwIfAborted(options.signal);
     const cssScan = await cdp.send<RuntimeEvaluateReply>(tabId, "Runtime.evaluate", {
@@ -352,6 +356,7 @@ export async function probeHoverSurfaces(
       if (results.length >= MAX_HOVER_SURFACES) break;
       if (seen.has(candidate.backendNodeId)) continue;
       try {
+        pointerDisturbed = true;
         await clearHover(cdp, tabId);
         throwIfAborted(options.signal);
         await waitForHover(HOVER_SETTLE_MS, options.signal);
@@ -400,6 +405,12 @@ export async function probeHoverSurfaces(
     if (isAbortError(err)) throw err;
     console.debug("[bsk capture] hover surface probe failed", err);
     return [];
+  } finally {
+    // Put the pointer back where the agent left it and let a re-opened menu
+    // settle. Skipped on a hard abort so cancellation stays fast.
+    if (pointerDisturbed && !options.signal?.aborted) {
+      await restoreHoverPointer(cdp, tabId, options.signal);
+    }
   }
 }
 
