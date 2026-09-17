@@ -2,6 +2,7 @@ import {
   type CaptureTargetDescriptor,
   describeEventTarget,
   describeTarget,
+  isMeaningfulClickTarget,
   resolveClickableElement,
   resolveHoverElement,
 } from "@/lib/describe-target";
@@ -164,6 +165,65 @@ function nearbyFillableFromSearchChrome(target: Element): FillableElement | null
     return fillable;
   }
   return null;
+}
+
+const PICKER_TRIGGER_SELECTOR = [
+  '[role="combobox"]',
+  '[aria-haspopup="listbox"]',
+  '[aria-haspopup="menu"]',
+  '[aria-haspopup="tree"]',
+  '[aria-haspopup="grid"]',
+  '[aria-haspopup="dialog"]',
+].join(", ");
+
+/** Bound the picker-ancestor walk so a page-level wrapper cannot claim every click. */
+const PICKER_TRIGGER_MAX_DEPTH = 4;
+
+function pickerTriggerAncestor(el: Element): Element | null {
+  let node: Element | null = el;
+  for (let depth = 0; node && depth <= PICKER_TRIGGER_MAX_DEPTH; depth += 1) {
+    if (node.matches(PICKER_TRIGGER_SELECTOR)) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function isDisabledControl(el: FillableElement): boolean {
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.disabled;
+  return el.getAttribute("aria-disabled") === "true";
+}
+
+/** A read-only control accepts no typed text, so a click is its only signal. */
+function isReadOnlyControl(el: FillableElement): boolean {
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.readOnly;
+  return false;
+}
+
+function pickerTriggerFor(fillable: FillableElement): Element | null {
+  return pickerTriggerAncestor(fillable) ?? (isReadOnlyControl(fillable) ? fillable : null);
+}
+
+/** Describe the ARIA picker a click opens, merging its role with the inner input's name. */
+function pickerTargetDescriptor(anchor: Element): CaptureTargetDescriptor | null {
+  const container = anchor.closest(PICKER_TRIGGER_SELECTOR) ?? anchor;
+  const containerDesc = describeTarget(container);
+  // A wrapper div carries the role while the control inside it carries the
+  // accessible name, and VOM reports the combination (`combobox "* Story"`).
+  const inner =
+    container === anchor
+      ? container.querySelector<FillableElement>(
+          'input,textarea,[contenteditable]:not([contenteditable="false"])',
+        )
+      : anchor;
+  const innerDesc = inner ? describeTarget(inner) : null;
+  const descriptor: CaptureTargetDescriptor = {
+    ...containerDesc,
+    ...(containerDesc.name || !innerDesc?.name ? {} : { name: innerDesc.name }),
+    ...(containerDesc.placeholder || !innerDesc?.placeholder
+      ? {}
+      : { placeholder: innerDesc.placeholder }),
+  };
+  return isMeaningfulClickTarget(descriptor) ? descriptor : null;
 }
 
 function captureGeometry(el: Element): RecordStepPayload["geometry"] {
@@ -705,16 +765,25 @@ export function startRecordCapture(
     return undefined;
   };
 
-  const emitClick = (event: MouseEvent) => {
+  const emitClick = (
+    event: MouseEvent,
+    options: { expectsNavigation?: boolean; anchor?: Element } = {},
+  ) => {
     // Only record clicks an LLM can re-identify (named interactive controls).
-    const target = describeEventTarget(eventTarget(event));
+    const eventTargetNode = options.anchor ?? eventTarget(event);
+    const target = options.anchor
+      ? pickerTargetDescriptor(options.anchor)
+      : describeEventTarget(eventTarget(event));
     if (!target) return;
-    markNavigationAction();
+    const expectsNavigation = options.expectsNavigation ?? true;
+    // Claiming a navigation makes the next URL change the effect of this click.
+    // Opening a list is not a navigation, so it must not absorb a later one.
+    if (expectsNavigation) markNavigationAction();
     emitStep({
       op: "click",
       target,
-      geometry: geometryForEventTarget(eventTarget(event)),
-      expects_navigation: true,
+      geometry: geometryForEventTarget(eventTargetNode),
+      expects_navigation: expectsNavigation,
     });
   };
 
@@ -797,6 +866,12 @@ export function startRecordCapture(
     if (fillable) {
       emitHoverCandidateBeforeAction(fillable);
       ensureFillSession(fillable);
+      // A disabled control cannot become a fill; recording the click would
+      // describe an action the page refused.
+      const pickerTrigger = isDisabledControl(fillable) ? null : pickerTriggerFor(fillable);
+      if (pickerTrigger) {
+        emitClick(event, { expectsNavigation: false, anchor: pickerTrigger });
+      }
       return;
     }
 

@@ -112,6 +112,117 @@ describe("record-capture semantic", () => {
     expect(steps.some((s) => s.op === "fill" && s.value === "hello")).toBe(true);
   });
 
+  it("records the click that opens an ARIA picker", () => {
+    document.body.innerHTML = `
+      <label id="story-label">* Story</label>
+      <div role="combobox" aria-haspopup="listbox" aria-expanded="false">
+        <input id="story" aria-labelledby="story-label" placeholder="Type to search" />
+      </div>
+    `;
+    const capture = startRecordCapture("rec-picker", (step) => steps.push(step));
+    const input = document.querySelector("#story")!;
+
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    capture.dispose();
+
+    expect(steps.filter((s) => s.op === "click")).toEqual([
+      expect.objectContaining({
+        op: "click",
+        target: expect.objectContaining({ name: "* Story", role: "combobox" }),
+        expects_navigation: false,
+      }),
+    ]);
+  });
+
+  it("does not attribute a later navigation to the picker click", () => {
+    document.body.innerHTML = `
+      <label id="story-label">* Story</label>
+      <div role="combobox" aria-haspopup="listbox">
+        <input id="story" aria-labelledby="story-label" />
+      </div>
+      <button type="button">Submit</button>
+    `;
+    const capture = startRecordCapture("rec-picker-nav", (step) => steps.push(step));
+    const input = document.querySelector("#story")!;
+    const button = document.querySelector("button")!;
+
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    capture.dispose();
+
+    const clicks = steps.filter((s) => s.op === "click");
+    expect(clicks.map((s) => s.expects_navigation)).toEqual([false, true]);
+  });
+
+  it("keeps a plain text field click out of the trace", () => {
+    document.body.innerHTML = `
+      <label for="title">Title</label>
+      <input id="title" name="title" />
+    `;
+    const capture = startRecordCapture("rec-plain-fill", (step) => steps.push(step));
+    const input = document.querySelector<HTMLInputElement>("#title")!;
+
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    input.value = "sample text";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    capture.dispose();
+
+    expect(steps.filter((s) => s.op === "click")).toHaveLength(0);
+    expect(steps.filter((s) => s.op === "fill")).toHaveLength(1);
+  });
+
+  it("records a click on a read-only picker input", () => {
+    document.body.innerHTML = `
+      <label for="owner">Owner</label>
+      <input id="owner" name="owner" readonly />
+    `;
+    const capture = startRecordCapture("rec-readonly-picker", (step) => steps.push(step));
+    const input = document.querySelector("#owner")!;
+
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    capture.dispose();
+
+    expect(steps.filter((s) => s.op === "click")).toHaveLength(1);
+  });
+
+  it("ignores a click on a disabled picker input", () => {
+    document.body.innerHTML = `
+      <label id="state-label">State</label>
+      <div role="combobox" aria-haspopup="listbox">
+        <input id="state" aria-labelledby="state-label" disabled />
+      </div>
+    `;
+    const capture = startRecordCapture("rec-disabled-picker", (step) => steps.push(step));
+    const input = document.querySelector("#state")!;
+
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    capture.dispose();
+
+    expect(steps).toEqual([]);
+  });
+
+  it("does not treat a distant picker wrapper as the clicked control", () => {
+    document.body.innerHTML = `
+      <div role="combobox" aria-haspopup="listbox">
+        <div><div><div><div><div>
+          <label for="note">Note</label>
+          <input id="note" name="note" />
+        </div></div></div></div></div>
+      </div>
+    `;
+    const capture = startRecordCapture("rec-far-picker", (step) => steps.push(step));
+    const input = document.querySelector("#note")!;
+
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0, detail: 1 }));
+    capture.dispose();
+
+    expect(steps.filter((s) => s.op === "click")).toHaveLength(0);
+  });
+
   it("records Enter press but not bare typing keys", () => {
     const capture = startRecordCapture("rec-press", (step) => steps.push(step));
     const input = document.querySelector("input")!;
