@@ -904,6 +904,17 @@ export async function captureVomObservation(
   throwIfAborted(options.signal, "observation");
   await cdp.ensureAttachedToUrl?.(tabId, url);
   throwIfAborted(options.signal, "observation");
+  // Single render option set for both the text and the visual branch: they share one
+  // `refStore`, so a difference here would hand `observe` a ref set that no longer
+  // matches the recording observation (and `snapshot`) for the same page.
+  // See R2-4.
+  //
+  // `keepRedundantRefChildren` is deliberately *not* defaulted on here: this is the
+  // `snapshot`/`observe` path, which keeps the terse HEAD rendering (the option stays
+  // at `renderVom`'s own default, `false`). Recording observation — the only caller
+  // that indexes refs by geometry — opts in at its own entry point
+  // (`tools/capture-vom-observation.ts`).
+  const renderOptions: CaptureVomObservationOptions = { ...options };
   const facts = await captureObservationFacts<CdpAxNode>(cdp, tabId, options.signal, url, {
     includeVisualFacts: options.includeVisualFacts,
   });
@@ -978,7 +989,7 @@ export async function captureVomObservation(
       identities,
       captured.rootFrameId ?? "root",
       notices,
-      options,
+      renderOptions,
     );
     return {
       ...projectRecordSafeObservation({
@@ -996,13 +1007,20 @@ export async function captureVomObservation(
   }
   const captureNotice = notices.join("\n");
   const rendered = renderVom(decoratedScene, {
-    maxDepth: options.maxDepth,
+    maxDepth: renderOptions.maxDepth,
     maxTokens:
-      !captureNotice || options.maxTokens === undefined
-        ? options.maxTokens
-        : Math.max(0, options.maxTokens - Math.ceil((captureNotice.length + 1) / 4)),
-    redactValues: options.redactValues,
-    activeRegionPolicy: options.activeRegionPolicy,
+      !captureNotice || renderOptions.maxTokens === undefined
+        ? renderOptions.maxTokens
+        : Math.max(0, renderOptions.maxTokens - Math.ceil((captureNotice.length + 1) / 4)),
+    redactValues: renderOptions.redactValues,
+    activeRegionPolicy: renderOptions.activeRegionPolicy,
+    // Passed through unchanged from the caller: `snapshot`/`observe` leave it
+    // undefined (so `renderVom`'s `false` default applies and a control nested inside
+    // a named ref node does not gain a second ref), while recording observation
+    // defaults it to `true` at `tools/capture-vom-observation.ts` so that a control
+    // behind a named combobox still gets its own `@eN` for the geometry-based ref
+    // index (`target-matcher`). See D2-rootcause.md §3.3 A and R2-4.
+    keepRedundantRefChildren: renderOptions.keepRedundantRefChildren,
   });
   if (captureNotice) rendered.text += `\n${captureNotice}`;
   throwIfAborted(options.signal, "observation");

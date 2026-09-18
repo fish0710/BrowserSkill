@@ -2655,6 +2655,44 @@ describe("handleSnapshot", () => {
     expect(ctx.refStore.resolve("e2")).toBeNull();
   });
 
+  it("prunes a named combobox's child control on the snapshot path (Fable review, medium)", async () => {
+    // `snapshot`/`observe` must keep HEAD's terse render: only the recording facade
+    // opts in to `keepRedundantRefChildren`, so the input behind the named combobox
+    // gets no `@eN` here.
+    const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
+    await sm.start("aa11");
+    const deps = makeDeps([
+      {
+        nodeId: "1",
+        role: { type: "role", value: "RootWebArea" },
+        name: { type: "computedString", value: "Example" },
+        backendDOMNodeId: 100,
+        childIds: ["2"],
+      },
+      {
+        nodeId: "2",
+        parentId: "1",
+        role: { type: "role", value: "combobox" },
+        name: { type: "computedString", value: "Story [expanded]" },
+        backendDOMNodeId: 200,
+        childIds: ["3"],
+      },
+      {
+        nodeId: "3",
+        parentId: "2",
+        role: { type: "role", value: "textbox" },
+        name: { type: "computedString", value: "Story" },
+        backendDOMNodeId: 300,
+      },
+    ]);
+
+    const res = await handleSnapshot(sm, { session_id: "aa11" }, deps);
+    if ("code" in res) throw new Error(`unexpected error: ${JSON.stringify(res)}`);
+    expect(res.text).toContain('combobox "Story [expanded]"');
+    expect(res.text).not.toContain('textbox "Story"');
+    expect(res.ref_count).toBe(1);
+  });
+
   it("keeps snapshots static without conditional surface probing", async () => {
     const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
     await sm.start("aa11");

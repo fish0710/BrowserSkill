@@ -773,6 +773,152 @@ describe("renderVom single-layer page", () => {
     expect(out.text).not.toContain('StaticText "13311030827"');
   });
 
+  it("keeps redundant ref children only when keepRedundantRefChildren is set", () => {
+    const nodes = [
+      node({ id: 1, role: "RootWebArea", name: "Doc" }),
+      node({ id: 2, parentId: 1, role: "combobox", name: "Story [expanded]", tag: "button" }),
+      node({ id: 3, parentId: 2, role: "textbox", name: "Story", tag: "input" }),
+    ];
+
+    const pruned = renderVom(scene(nodes));
+    expect(pruned.text).toContain('@e1 combobox "Story [expanded]"');
+    expect(pruned.text).not.toContain('@e2 textbox "Story"');
+    expect(coreRefs(pruned.refs)).toEqual([{ ref: "e1", backendNodeId: 2 }]);
+
+    const kept = renderVom(scene(nodes), { keepRedundantRefChildren: true });
+    expect(kept.text).toContain('@e1 combobox "Story [expanded]"');
+    expect(kept.text).toContain('@e2 textbox "Story"');
+    expect(coreRefs(kept.refs)).toEqual([
+      { ref: "e1", backendNodeId: 2 },
+      { ref: "e2", backendNodeId: 3 },
+    ]);
+  });
+
+  it("keeps pure text children pruned even with keepRedundantRefChildren", () => {
+    const nodes = [
+      node({ id: 1, role: "RootWebArea", name: "Doc" }),
+      node({ id: 2, parentId: 1, role: "combobox", name: "Story Story", tag: "button" }),
+      node({ id: 3, parentId: 2, role: "StaticText", name: "Story" }),
+    ];
+
+    const out = renderVom(scene(nodes), { keepRedundantRefChildren: true });
+    expect(out.text).toContain('@e1 combobox "Story Story"');
+    expect(out.text).not.toContain('StaticText "Story"');
+    expect(coreRefs(out.refs)).toEqual([{ ref: "e1", backendNodeId: 2 }]);
+  });
+
+  it("keeps the ref child of a named combobox plus the text its name does not cover (R2-5)", () => {
+    const nodes = [
+      node({ id: 1, role: "RootWebArea", name: "Doc" }),
+      node({ id: 2, parentId: 1, role: "combobox", name: "Story [expanded]", tag: "div" }),
+      node({ id: 3, parentId: 2, role: "listitem", name: "Story one", tag: "li" }),
+      node({ id: 4, parentId: 2, role: "textbox", name: "Story", tag: "input" }),
+      node({ id: 5, parentId: 2, role: "listitem", name: "Story two", tag: "li" }),
+    ];
+
+    const out = renderVom(scene(nodes), { keepRedundantRefChildren: true });
+
+    expect(out.text).toContain('@e1 combobox "Story [expanded]"');
+    expect(out.text).toContain('@e2 textbox "Story"');
+    // A single nested ref must not unprune the whole subtree, but the rows are not
+    // "redundant" either: the name `Story [expanded]` does not cover `Story one`,
+    // so the text filter — the one that made children redundant — does not apply and
+    // the option rows survive while only the ref-bearing child gains an `@eN`.
+    expect(out.text).toContain('listitem "Story one"');
+    expect(out.text).toContain('listitem "Story two"');
+    expect(coreRefs(out.refs)).toEqual([
+      { ref: "e1", backendNodeId: 2 },
+      { ref: "e2", backendNodeId: 4 },
+    ]);
+  });
+
+  it("keeps an uncovered listbox status line beside its option refs (Fable review, medium)", () => {
+    const nodes = [
+      node({ id: 1, role: "RootWebArea", name: "Doc" }),
+      node({ id: 2, parentId: 1, role: "listbox", name: "Countries", tag: "div" }),
+      node({ id: 3, parentId: 2, role: "StaticText", name: "No results for query", tag: "span" }),
+      node({ id: 4, parentId: 2, role: "option", name: "France", tag: "div" }),
+    ];
+
+    const out = renderVom(scene(nodes), { keepRedundantRefChildren: true });
+
+    // Both rows are information: the status text is not covered by "Countries", so the
+    // child filter must not treat it as redundant; the option is the ref the geometry
+    // index needs. Neither may be dropped.
+    expect(out.text).toContain('@e1 listbox "Countries"');
+    expect(out.text).toContain('StaticText "No results for query"');
+    expect(out.text).toContain('@e2 option "France"');
+    expect(coreRefs(out.refs)).toEqual([
+      { ref: "e1", backendNodeId: 2 },
+      { ref: "e2", backendNodeId: 4 },
+    ]);
+  });
+
+  it("still prunes text covered by the container name even next to a ref child (R2-5)", () => {
+    const nodes = [
+      node({ id: 1, role: "RootWebArea", name: "Doc" }),
+      node({ id: 2, parentId: 1, role: "combobox", name: "Story Story", tag: "div" }),
+      node({ id: 3, parentId: 2, role: "StaticText", name: "Story", tag: "span" }),
+      node({ id: 4, parentId: 2, role: "textbox", name: "Story", tag: "input" }),
+    ];
+
+    const out = renderVom(scene(nodes), { keepRedundantRefChildren: true });
+
+    expect(out.text).toContain('@e1 combobox "Story Story"');
+    expect(out.text).toContain('@e2 textbox "Story"');
+    // Every plain-text descendant is covered by the name ⇒ pure redundancy, dropped.
+    expect(out.text).not.toContain('StaticText "Story"');
+    expect(coreRefs(out.refs)).toEqual([
+      { ref: "e1", backendNodeId: 2 },
+      { ref: "e2", backendNodeId: 4 },
+    ]);
+  });
+
+  it("never echoes a masked value from a named container's text descendants (R2-6)", () => {
+    const nodes = [
+      node({ id: 1, role: "RootWebArea", name: "Doc" }),
+      node({
+        id: 2,
+        parentId: 1,
+        role: "combobox",
+        name: "Payment",
+        value: "hunter2",
+        sensitive: true,
+        tag: "div",
+      }),
+      node({ id: 3, parentId: 2, role: "StaticText", name: "hunter2", tag: "span" }),
+      node({ id: 4, parentId: 2, role: "StaticText", text: "hunter2", tag: "span" }),
+    ];
+
+    const out = renderVom(scene(nodes), { keepRedundantRefChildren: true, redactValues: true });
+
+    // A div-based ARIA combobox is not a native `input`, but its mask must still be
+    // authoritative for the subtree that echoes it.
+    expect(out.text).toContain('@e1 combobox "Payment" ="•••"');
+    expect(out.text).not.toContain("hunter2");
+  });
+
+  it("never echoes a native input's own value text when the switch is on", () => {
+    const out = renderVom(
+      scene([
+        node({ id: 1, role: "RootWebArea", name: "Doc" }),
+        node({
+          id: 2,
+          parentId: 1,
+          role: "textbox",
+          name: "Password",
+          value: "hunter2",
+          tag: "input",
+        }),
+        node({ id: 3, parentId: 2, role: "StaticText", name: "hunter2" }),
+      ]),
+      { keepRedundantRefChildren: true, redactValues: true },
+    );
+
+    expect(out.text).toContain('@e1 textbox "Password" [filled] ="•••"');
+    expect(out.text).not.toContain("hunter2");
+  });
+
   it("renders placeholder separately from input value and state", () => {
     const out = renderVom(
       scene([

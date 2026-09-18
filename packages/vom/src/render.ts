@@ -739,8 +739,14 @@ function renderNodeLine(
   return line;
 }
 
-function shouldSkipRedundantRefChildren(node: VomNode): boolean {
+function shouldSkipRedundantRefChildren(
+  node: VomNode,
+  state: RenderState,
+  keepChildren: boolean,
+): boolean {
   const role = normalizedRole(node);
+  // Always pruned: a native text control's descendants are its own value text, and
+  // rendering them would echo the value that `redactValues` masks on the control line.
   if (
     ["textbox", "searchbox"].includes(role) &&
     ["input", "textarea"].includes((node.tag ?? "").toLowerCase())
@@ -748,24 +754,82 @@ function shouldSkipRedundantRefChildren(node: VomNode): boolean {
     return true;
   }
   if (!cleaned(node.name)) return false;
+  if (keepChildren) {
+    // Opt-in escape hatch for recording observation: keep the descendants only when
+    // they carry a reference of their own (e.g. the input behind a named combobox).
+    // The ref short-circuit is deliberately kept out of the coverage test: a single
+    // nested control must not unprune the whole subtree, so the caller filters the
+    // children down to the referenceable ones instead.
+    if (hasReferenceDescendant(node, state)) return false;
+    return descendantTextCoveredByName(node, state, true);
+  }
   return ["button", "link", "menuitem", "tab", "switch", "checkbox", "radio", "combobox"].includes(
     role,
   );
 }
 
-function descendantTextCoveredByName(node: VomNode, state: RenderState): boolean {
+function descendantTextCoveredByName(
+  node: VomNode,
+  state: RenderState,
+  keepTexts = false,
+): boolean {
   const name = cleaned(node.name);
   if (!name) return false;
   const stack = [...(state.children.get(node.id) ?? [])];
   const texts: string[] = [];
   while (stack.length > 0) {
     const child = stack.pop() as VomNode;
-    if (isVomReferenceNode(child)) return false;
+    // Legacy callers (table cells) treat any nested ref as not-covered. The
+    // `keepRedundantRefChildren` path opts out: it only needs to know whether the
+    // remaining value/text is already covered by this node's name.
+    if (!keepTexts && isVomReferenceNode(child)) return false;
     const text = cleaned(child.name) ?? cleaned(child.text) ?? cleaned(child.value);
     if (text) texts.push(text);
     stack.push(...(state.children.get(child.id) ?? []));
   }
   return texts.length > 0 && texts.every((text) => name.includes(text));
+}
+
+/** True when any descendant of `node` carries its own `@eN` (interactive or visual). */
+function hasReferenceDescendant(node: VomNode, state: RenderState): boolean {
+  const stack = [...(state.children.get(node.id) ?? [])];
+  while (stack.length > 0) {
+    const child = stack.pop() as VomNode;
+    if (child.visualKey !== undefined || isVomReferenceNode(child)) return true;
+    stack.push(...(state.children.get(child.id) ?? []));
+  }
+  return false;
+}
+
+/** True when this node's own line renders a masked value (`=•••`). */
+function rendersMaskedValue(node: VomNode, redactValues: boolean): boolean {
+  if (node.sensitive) return true;
+  if (!redactValues) return false;
+  return (
+    cleaned(node.value) !== undefined ||
+    node.inputState === "filled" ||
+    node.inputState === "default"
+  );
+}
+
+/**
+ * Value-echo guard, independent of role and tag: under a masked line (`=•••`) any
+ * descendant that is not itself a referenceable control is value/text that would
+ * restore what the mask hides, so the whole subtree is dropped. R2-6.
+ */
+function echoesMaskedValueText(node: VomNode, state: RenderState, redactValues: boolean): boolean {
+  if (!rendersMaskedValue(node, redactValues)) return false;
+  const stack = [...(state.children.get(node.id) ?? [])];
+  while (stack.length > 0) {
+    const child = stack.pop() as VomNode;
+    if (child.visualKey !== undefined) continue;
+    if (!isVomReferenceNode(child)) {
+      const text = cleaned(child.name) ?? cleaned(child.text) ?? cleaned(child.value);
+      if (text) return true;
+    }
+    stack.push(...(state.children.get(child.id) ?? []));
+  }
+  return false;
 }
 
 function shouldSkipRedundantChildren(node: VomNode, state: RenderState): boolean {
@@ -785,6 +849,7 @@ interface RenderState {
   maxDepth: number;
   maxTokens: number;
   redactValues: boolean;
+  keepRedundantRefChildren: boolean;
   truncated: boolean;
   children: Map<number | null, VomNode[]>;
   parentMap: Map<number, number | null>;
@@ -808,9 +873,25 @@ function pushRenderChildren(
   stack: Array<{ node: VomNode; depth: number }>,
   children: readonly VomNode[],
   depth: number,
+  keepInteractiveOnly = false,
+  state?: RenderState,
 ): void {
   for (let index = children.length - 1; index >= 0; index -= 1) {
-    stack.push({ node: children[index], depth });
+    const child = children[index];
+    // `keepRedundantRefChildren` only unprunes the control itself (and the wrappers
+    // that lead to it); the pure text rows are dropped here **only** when they are
+    // genuinely redundant, which the caller establishes by asking
+    // `descendantTextCoveredByName` first. Text the parent name does not cover (e.g.
+    // a listbox named "Countries" holding "No results for query") is content, not
+    // redundancy, so it survives.
+    if (
+      keepInteractiveOnly &&
+      child.visualKey === undefined &&
+      !isVomReferenceNode(child) &&
+      !(state && hasReferenceDescendant(child, state))
+    )
+      continue;
+    stack.push({ node: child, depth });
   }
 }
 
@@ -887,11 +968,29 @@ function* renderTreeRows(
 
     if (
       (!observation || !state.visualAncestors.has(node.id)) &&
-      ((ref && shouldSkipRedundantRefChildren(node)) || shouldSkipRedundantChildren(node, state))
+      ((ref && shouldSkipRedundantRefChildren(node, state, state.keepRedundantRefChildren)) ||
+        (ref && echoesMaskedValueText(node, state, state.redactValues)) ||
+        shouldSkipRedundantChildren(node, state))
     ) {
       continue;
     }
-    pushRenderChildren(stack, children.get(node.id) ?? [], depth + 1);
+    pushRenderChildren(
+      stack,
+      children.get(node.id) ?? [],
+      depth + 1,
+      // A named ref node whose subtree was only saved by a nested control must not
+      // also re-admit the plain text descendants that its name already covers. The
+      // coverage test is what keeps this filter at its original "redundant text only"
+      // meaning: when the name does not cover the text, the rows are information the
+      // agent would otherwise lose, so the whole subtree renders.
+      !!(
+        ref &&
+        state.keepRedundantRefChildren &&
+        hasReferenceDescendant(node, state) &&
+        descendantTextCoveredByName(node, state, true)
+      ),
+      state,
+    );
   }
 }
 
@@ -912,6 +1011,7 @@ function createRenderState(
     maxDepth: options.maxDepth ?? DEFAULT_MAX_DEPTH,
     maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     redactValues: options.redactValues ?? false,
+    keepRedundantRefChildren: options.keepRedundantRefChildren ?? false,
     truncated: false,
     children,
     parentMap: buildParentMap(nodes),

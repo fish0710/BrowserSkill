@@ -93,6 +93,15 @@ export interface VomOptions {
    * public layer header format.
    */
   activeRegionPolicy?: boolean;
+  /**
+   * Keep the descendants of a referenceable node even when its name already
+   * covers them (e.g. a named combobox containing the input it triggers).
+   *
+   * Off by default: interactive refs stay terse. Recording observation opts in
+   * so that a nested control still receives its own stable `@eN`, which the
+   * ref index needs to resolve a target that geometrically matches the child.
+   */
+  keepRedundantRefChildren?: boolean;
 }
 
 export interface CondSurface {
