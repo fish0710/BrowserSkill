@@ -586,9 +586,10 @@ pub(crate) fn spawn_session_idle_reaper(state: Arc<DaemonState>) -> tokio::task:
 /// [`crate::cli::update::DAEMON_REFRESH_WINDOW`] (25min — shorter than
 /// the 30min tick, so steady state really refreshes on every tick
 /// instead of every other one). The task
-/// loops forever; shutdown aborts it like the other background tasks, so
-/// it never delays daemon exit (an in-flight fetch is bounded by the
-/// update client's own timeout and detached on abort).
+/// loops forever; shutdown aborts it like the other background tasks. Its
+/// blocking network work runs on a dedicated detached OS thread rather
+/// than tokio's blocking pool (see [`run_update_check_step`]), so a fetch
+/// in flight when the daemon stops cannot delay process exit.
 ///
 /// When a tick finds a newer version the daemon also *installs* it
 /// (auto-update, on by default; [`crate::cli::update::AUTO_UPDATE_ENV`]
@@ -652,41 +653,46 @@ pub(crate) fn spawn_update_check_task(
                 continue;
             }
 
+            // Run the blocking fetch/install step on a dedicated OS
+            // thread, *not* on tokio's blocking pool. Dropping (or
+            // shutting down) the runtime waits for the blocking pool to
+            // drain, so an in-flight `reqwest::blocking` fetch — bounded
+            // only by `FETCH_TIMEOUT` (10s) — used to keep the daemon
+            // process alive long after `daemon stop` had already returned
+            // success. A detached thread is simply abandoned when the
+            // process exits, so shutdown never waits on the network. The
+            // normal path is unchanged: the task still awaits the result
+            // before acting on it.
             let result = {
                 let cache_path = cache_path.clone();
                 let state = Arc::clone(&state);
                 let exe_path = exe_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    let candidate = update::refresh_update_cache(&cache_path)?;
-                    // The session gate is read after the fetch, as late
-                    // as possible before the binary gets replaced.
-                    let active_sessions = state.sessions.len();
-                    let auto_update = update::auto_update_enabled() && exe_path.is_some();
-                    update::auto_update_step(
-                        candidate.as_ref(),
-                        auto_update,
-                        active_sessions,
-                        |candidate| {
-                            let target =
-                                exe_path.as_deref().context("current executable unknown")?;
-                            update::self_install_candidate(
-                                candidate,
-                                target,
-                                &restart_start_args(&state.config)?,
-                            )
-                        },
-                    )
-                })
-                .await
-            };
-            let outcome = match result {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(err)) => {
-                    warn!(error = %err, "periodic update check failed");
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                let spawn = std::thread::Builder::new()
+                    .name("bsk-update-check".to_string())
+                    .spawn(move || {
+                        let _ =
+                            result_tx.send(run_update_check_step(&cache_path, &state, exe_path));
+                    });
+                if let Err(err) = spawn {
+                    warn!(
+                        error = %err,
+                        "periodic update check skipped: cannot spawn worker thread"
+                    );
                     continue;
                 }
+                match result_rx.await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!("periodic update check abandoned during shutdown");
+                        continue;
+                    }
+                }
+            };
+            let outcome = match result {
+                Ok(outcome) => outcome,
                 Err(err) => {
-                    warn!(error = %err, "periodic update check task panicked");
+                    warn!(error = %err, "periodic update check failed");
                     continue;
                 }
             };
@@ -738,6 +744,34 @@ pub(crate) fn spawn_update_check_task(
             }
         }
     })
+}
+
+/// One update-check tick's blocking work: refresh the manifest cache and,
+/// when a newer version exists, install it. Runs on a dedicated OS thread
+/// owned by [`spawn_update_check_task`] (never on tokio's blocking pool) so
+/// that shutting the daemon down is not delayed by an in-flight HTTP fetch;
+/// the thread is detached and dies with the process.
+fn run_update_check_step(
+    cache_path: &Path,
+    state: &DaemonState,
+    exe_path: Option<std::path::PathBuf>,
+) -> Result<crate::cli::update::AutoUpdateOutcome> {
+    use crate::cli::update;
+
+    let candidate = update::refresh_update_cache(cache_path)?;
+    // The session gate is read after the fetch, as late as possible
+    // before the binary gets replaced.
+    let active_sessions = state.sessions.len();
+    let auto_update = update::auto_update_enabled() && exe_path.is_some();
+    update::auto_update_step(
+        candidate.as_ref(),
+        auto_update,
+        active_sessions,
+        |candidate| {
+            let target = exe_path.as_deref().context("current executable unknown")?;
+            update::self_install_candidate(candidate, target, &restart_start_args(&state.config)?)
+        },
+    )
 }
 
 /// Rebuild the `StartArgs` for the replacement daemon from the running
