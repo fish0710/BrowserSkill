@@ -21,6 +21,9 @@ export default defineConfig({
   },
   define: {
     __BSK_EXT_VERSION__: JSON.stringify(pkg.version),
+    // Fixed stand-in for the real build stamp so tests are deterministic and do
+    // not depend on the working tree being clean (see wxt.config.ts).
+    __BUILD_STAMP__: JSON.stringify("test"),
     __BSK_DAEMON_WS_URL__: JSON.stringify(process.env.BSK_DAEMON_WS_URL ?? "ws://127.0.0.1:52800"),
   },
   resolve: {

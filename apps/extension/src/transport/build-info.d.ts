@@ -7,6 +7,15 @@
 declare const __BSK_EXT_VERSION__: string;
 
 /**
+ * Build stamp of this bundle, `<short-sha>[-dirty].<yyyyMMdd-HHmm>` (or `nogit`
+ * when git is unavailable). Injected by `wxt.config.ts`; tests substitute the
+ * literal `"test"` via `vitest.config.ts`. See
+ * `src/lib/recording/trace-state-body.ts` for the consumer that writes it into
+ * the exported state front matter.
+ */
+declare const __BUILD_STAMP__: string;
+
+/**
  * WebSocket URL the extension uses to connect to the local bsk daemon.
  * Defaults to {@code ws://127.0.0.1:52800}. Override at build time by
  * setting the {@code BSK_DAEMON_WS_URL} environment variable.
