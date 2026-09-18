@@ -9,6 +9,12 @@ const MIN_CAPTURE_INTERVAL_MS = 200;
 
 export interface TabObservationCursor {
   lastSettled: RegisteredObservation | null;
+  /**
+   * When `lastSettled` was registered. `undefined` means the observation was
+   * injected by a caller that has no arrival clock (tests, transitional code),
+   * which is treated as "usable as a pre-state".
+   */
+  lastSettledAt?: number;
   lastCaptureAt: number;
 }
 
@@ -66,6 +72,12 @@ export class RecordingObservationSession {
     tabId: number,
     signal?: AbortSignal,
   ): Promise<RegisteredObservation> {
+    // Sampling clock, taken before the throttle wait and before any `await`, so
+    // it is as close to the CDP DOM read as this layer can get and is never
+    // inflated by queueing. It is the clock `bindDraft` compares against
+    // `arrivedAt`: a sample that *began* before the action arrived is that
+    // action's pre-state even if it only settled afterwards (E11).
+    const capturedAt = Date.now();
     const waitMs = Math.max(0, MIN_CAPTURE_INTERVAL_MS - (Date.now() - this.cursor.lastCaptureAt));
     if (waitMs > 0) await abortableDelay(waitMs, signal);
     if (signal?.aborted) throw new DOMException("observation aborted", "AbortError");
@@ -83,18 +95,37 @@ export class RecordingObservationSession {
       vomText: captured.vomText,
       truncated: captured.truncated,
     });
+    const settledAt = Date.now();
     const observation: RegisteredObservation = {
       stateId: state.id,
       rootFrameId: captured.rootFrameId,
       index: captured.index,
       url: captured.url,
+      // Carried on the observation itself (E9/E11) so the settle controller can
+      // decide "had this sample already started when that action arrived?"
+      // without reading back through the shared cursor, which may already point
+      // at a newer capture by the time a queued task resumes.
+      capturedAt,
+      settledAt,
     };
     this.cursor.lastSettled = observation;
-    this.cursor.lastCaptureAt = Date.now();
+    this.cursor.lastSettledAt = settledAt;
+    this.cursor.lastCaptureAt = settledAt;
     return observation;
   }
 
-  bindDraft(draft: RecordingDraftStep, draftId: number, previousActionPending = false): void {
+  /**
+   * Attach the most recent observation to `draft`.
+   *
+   * A pending previous action no longer skips binding: that early return threw
+   * away `preStateId` *and* `markStep`, which is how a step ended up with no
+   * pre-state at all (and, downstream, with `state === result.state`). Whether
+   * an observation may stand in as this step's pre-state is decided by the
+   * timestamp guard below instead.
+   *
+   * `arrivedAt` is the moment the caller received this action.
+   */
+  bindDraft(draft: RecordingDraftStep, draftId: number, arrivedAt: number = Date.now()): void {
     const observation = this.cursor.lastSettled;
     if (isTargeted(draft)) {
       draft.matchedTarget = observation
@@ -105,10 +136,32 @@ export class RecordingObservationSession {
           })
         : unmatchedTarget(draft.captureTarget);
     }
-    if (!observation) return;
+    if (!observation) {
+      // No observation at all. Record the reason so the reducer can count the
+      // gap without claiming a late snapshot was rejected (R1-5).
+      draft.preStateRejected = "none";
+      return;
+    }
 
-    const unmatched = isTargeted(draft) && draft.matchedTarget?.unmatched === true;
-    if (previousActionPending && unmatched) return;
+    // What disqualifies an observation is that its *sampling* began after the
+    // action arrived: it was started on the far side of that action, so it
+    // shows the state the action produced (a panel it opened, a page it
+    // navigated to). A sample that started before the action and only settled
+    // afterwards is still a legal pre-state — that is the hover-opens-menu /
+    // click-500ms-later shape (E11) — so the guard uses `capturedAt`, not the
+    // registration clock. Leave `preStateId` unbound instead of recording a
+    // post-action snapshot as a pre-action one; the reducer turns this reason
+    // into an explicit marker.
+    //
+    // The cursor fallback keeps observations injected by tests/transitional
+    // code (which only set `lastSettledAt`, or `settledAt`) on the old clock.
+    const capturedAt = observation.capturedAt ?? this.cursor.lastSettledAt ?? observation.settledAt;
+    if (capturedAt !== undefined && capturedAt > arrivedAt) {
+      draft.preStateRejected = "late";
+      return;
+    }
+    draft.preStateRejected = undefined;
+
     draft.preStateId = observation.stateId;
     this.registry.markStep(observation.stateId, draftId);
 

@@ -10,6 +10,27 @@ vi.stubGlobal("chrome", {
   },
 });
 
+// R1-6: `collectHoverSurfaceStates()` is a full `document.querySelectorAll("*")`
+// walk, so counting its invocations is the direct evidence that the action path
+// only scans when it truly has to.
+const hoverSurfaceScanCounter = vi.hoisted(() => ({
+  count: 0,
+  // Lets a test model a scan that is itself slow (R2-7): the hook runs where
+  // the real `document.querySelectorAll("*")` walk would spend its time.
+  onScan: undefined as (() => void) | undefined,
+}));
+vi.mock("../record-hover-surface", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../record-hover-surface")>();
+  return {
+    ...actual,
+    collectHoverSurfaceStates: () => {
+      hoverSurfaceScanCounter.count += 1;
+      hoverSurfaceScanCounter.onScan?.();
+      return actual.collectHoverSurfaceStates();
+    },
+  };
+});
+
 function mockRect(
   el: Element,
   rect: { left: number; top: number; width: number; height: number },
@@ -53,6 +74,8 @@ describe("record-capture semantic", () => {
 
   beforeEach(() => {
     steps = [];
+    hoverSurfaceScanCounter.count = 0;
+    hoverSurfaceScanCounter.onScan = undefined;
     document.body.innerHTML = `
       <label for="q">查询</label>
       <input id="q" name="q" />
@@ -1682,5 +1705,512 @@ describe("record-capture semantic", () => {
     capture.dispose();
 
     expect(steps.map((s) => s.op)).toEqual(["fill"]);
+  });
+
+  it("does not re-emit a hover for an element that was already clicked", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T10:10:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <button type="button" aria-label="新建" aria-haspopup="menu">新建</button>
+        <div class="create-menu dropdown-menu">
+          <div class="tg-menu-item" tabindex="0">文档C+D</div>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-click-then-hover", (step) => steps.push(step));
+      const trigger = document.querySelector("button")!;
+      const menu = document.querySelector(".create-menu")!;
+      const item = document.querySelector(".tg-menu-item")!;
+      mockRect(trigger, { left: 900, top: 8, width: 60, height: 32 });
+      mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+      mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+      mockHoverStyle([item]);
+
+      // The trigger is clicked, then the revealed menu item is clicked 5s later
+      // while the mouse stays on the trigger. The hover that preceded the click
+      // is already described by that click, so it must not be replayed as a new
+      // step for the item action (R1-3).
+      mouseOver(trigger);
+      click(trigger);
+      vi.setSystemTime(new Date("2026-08-07T10:10:05.000Z"));
+      click(item);
+      capture.dispose();
+
+      expect(steps.filter((s) => s.op === "hover")).toHaveLength(0);
+      expect(steps.map((s) => s.op)).toEqual(["click", "click"]);
+      expect(steps[0]).toMatchObject({ op: "click", target: { name: "新建" } });
+      expect(steps[1]).toMatchObject({ op: "click", target: { name: "文档C+D" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records a new hover for an element that was clicked in an earlier cycle", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T10:00:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <div class="user dropdown" role="button" aria-label="image">
+          <img alt="image" />
+          <ul>
+            <li><a href="/u/me">My profile</a></li>
+          </ul>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-hover-after-click", (step) => steps.push(step));
+      const trigger = document.querySelector('[role="button"]')!;
+      const menu = document.querySelector("ul")!;
+      const item = document.querySelector("a")!;
+      mockRect(trigger, { left: 900, top: 8, width: 32, height: 32 });
+      mockRect(menu, { left: 820, top: 48, width: 160, height: 80 });
+
+      // Cycle 1: hovering the trigger and clicking it is one action, so the
+      // click already describes it and no hover step is due.
+      mouseOver(trigger);
+      click(trigger);
+      expect(steps.map((s) => s.op)).toEqual(["click"]);
+
+      // Cycle 2: the user reopens the same menu 5s later and picks an item. This
+      // is a genuinely new hover and must not be swallowed by the earlier click
+      // on the same element (R1-3).
+      vi.setSystemTime(new Date("2026-08-07T10:00:05.000Z"));
+      mouseOver(trigger);
+      click(item);
+      capture.dispose();
+
+      expect(steps.map((s) => s.op)).toEqual(["click", "hover", "click"]);
+      expect(steps[1]).toMatchObject({
+        op: "hover",
+        target: { role: "button", name: "image" },
+      });
+      expect(steps[2]).toMatchObject({
+        op: "click",
+        target: { role: "link", name: "My profile" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops a contained opener older than the hover surface window", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T09:00:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <div class="create-menu dropdown-menu" tabindex="0">
+          <button type="button">文档C+D</button>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-stale-contained-opener", (step) => steps.push(step));
+      const menu = document.querySelector(".create-menu")!;
+      const item = document.querySelector("button")!;
+      mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+      mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+      mockHoverStyle([menu]);
+
+      // The menu is a policy-eligible candidate while visible, then it closes
+      // (`display: none`) before the contained item is ever acted on.
+      mouseOver(menu);
+      vi.spyOn(window, "getComputedStyle").mockImplementation((el) => {
+        const hidden = el === menu || el === item;
+        const style = {
+          cursor: el === menu ? "pointer" : "",
+          display: hidden ? "none" : "block",
+          pointerEvents: hidden ? "none" : "auto",
+          position: "static",
+          visibility: hidden ? "hidden" : "visible",
+        } as CSSStyleDeclaration;
+        return style;
+      });
+
+      // 30s later the closed menu must not resurface as a hover step.
+      vi.setSystemTime(new Date("2026-08-07T09:00:30.000Z"));
+      click(item);
+      capture.dispose();
+
+      expect(steps.filter((s) => s.op === "hover")).toHaveLength(0);
+      expect(steps.map((s) => s.op)).toEqual(["click"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops an ineligible contained opener whose surface is not visible", () => {
+    document.body.innerHTML = `
+      <div class="create-menu dropdown-menu" tabindex="0">
+        <button type="button">文档C+D</button>
+      </div>
+    `;
+    const capture = startRecordCapture("rec-ineligible-contained-opener", (step) =>
+      steps.push(step),
+    );
+    const menu = document.querySelector(".create-menu")!;
+    const item = document.querySelector("button")!;
+    mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+    mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el) => {
+      const hidden = el === menu || el === item;
+      const style = {
+        cursor: "pointer",
+        display: hidden ? "none" : "block",
+        pointerEvents: hidden ? "none" : "auto",
+        position: "static",
+        visibility: hidden ? "hidden" : "visible",
+        fontSize: "14px",
+      } as CSSStyleDeclaration;
+      return style;
+    });
+
+    // Never-visible surface: the mouseover only produced an ineligible
+    // candidate, so acting inside it must not invent a hover step.
+    mouseOver(menu);
+    click(item);
+    capture.dispose();
+
+    expect(steps.filter((s) => s.op === "hover")).toHaveLength(0);
+    expect(steps.map((s) => s.op)).toEqual(["click"]);
+  });
+
+  it("keeps the opener hover when the menu stays open until its item is clicked", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T09:30:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <button type="button" aria-label="新建" aria-haspopup="menu">新建</button>
+        <div class="create-menu dropdown-menu">
+          <div class="tg-menu-item" tabindex="0">文档C+D</div>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-opener-hover-menu-item", (step) => steps.push(step));
+      const trigger = document.querySelector("button")!;
+      const menu = document.querySelector(".create-menu")!;
+      const item = document.querySelector(".tg-menu-item")!;
+      mockRect(trigger, { left: 900, top: 8, width: 60, height: 32 });
+      mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+      mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+      mockHoverStyle([item]);
+
+      mouseOver(trigger);
+      // Human-paced pause: the menu is still visible, so the opener hover stays
+      // legitimate even though the 10s candidate window has passed.
+      vi.setSystemTime(new Date("2026-08-07T09:30:30.000Z"));
+      mouseOver(menu);
+      click(item);
+      capture.dispose();
+
+      expect(steps.map((s) => s.op)).toEqual(["hover", "click"]);
+      expect(steps[0]).toMatchObject({
+        op: "hover",
+        target: { role: "button", name: "新建" },
+      });
+      expect(steps[1]).toMatchObject({ op: "click", target: { name: "文档C+D" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("binds a surface whose opener was hovered 15s earlier", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T11:00:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <button type="button" aria-label="新建" aria-haspopup="menu">新建</button>
+        <div class="create-menu dropdown-menu" style="display: none">
+          <div class="tg-menu-item" tabindex="0">文档C+D</div>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-slow-surface-binding", (step) => steps.push(step));
+      const trigger = document.querySelector("button")!;
+      const menu = document.querySelector(".create-menu") as HTMLElement;
+      const item = document.querySelector(".tg-menu-item")!;
+      mockRect(trigger, { left: 900, top: 8, width: 60, height: 32 });
+      mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+      mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+      vi.spyOn(window, "getComputedStyle").mockImplementation((el) => {
+        const hidden = (el as HTMLElement).style?.display === "none";
+        const style = {
+          cursor: el === item ? "pointer" : "",
+          display: hidden ? "none" : "block",
+          pointerEvents: hidden ? "none" : "auto",
+          position: "static",
+          visibility: hidden ? "hidden" : "visible",
+        } as CSSStyleDeclaration;
+        return style;
+      });
+
+      // Lazy menu: the opener is hovered while nothing is visible yet, and the
+      // menu only appears 15s later - past the 10s candidate window but inside
+      // the 30s surface-binding window. The freshly visible surface must still
+      // bind to that opener, otherwise the item click loses its causal hover
+      // (R1-7). Measured against the old shared 10s window this test yields
+      // `["click"]`.
+      mouseOver(trigger);
+      vi.setSystemTime(new Date("2026-08-07T11:00:15.000Z"));
+      menu.style.display = "block";
+      const scansBeforeAction = hoverSurfaceScanCounter.count;
+      click(item);
+      capture.dispose();
+
+      // The binding is checked against the live DOM, so the fallback path does
+      // run a scan - the lazy fast path is only a shortcut, not a removal. It
+      // must run exactly once though: the surface lookup and the visibility
+      // check share one snapshot instead of scanning twice (R1-6).
+      expect(hoverSurfaceScanCounter.count).toBe(scansBeforeAction + 1);
+      expect(steps.map((s) => s.op)).toEqual(["hover", "click"]);
+      expect(steps[0]).toMatchObject({
+        op: "hover",
+        target: { role: "button", name: "新建" },
+      });
+      expect(steps[1]).toMatchObject({ op: "click", target: { tag: "div", name: "文档C+D" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips the full-DOM hover surface scan when the opener is eligible", () => {
+    document.body.innerHTML = `
+      <button type="button" aria-label="新建" aria-haspopup="menu">新建</button>
+      <div class="create-menu dropdown-menu">
+        <div class="tg-menu-item" tabindex="0">文档C+D</div>
+      </div>
+    `;
+    const capture = startRecordCapture("rec-lazy-surface-scan", (step) => steps.push(step));
+    const trigger = document.querySelector("button")!;
+    const menu = document.querySelector(".create-menu")!;
+    const item = document.querySelector(".tg-menu-item")!;
+    mockRect(trigger, { left: 900, top: 8, width: 60, height: 32 });
+    mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+    mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+    mockHoverStyle([item]);
+
+    // The candidate passes hover-trigger policy, so the opener is accepted from
+    // the in-memory candidate window alone. The action path must not pay for a
+    // `document.querySelectorAll("*")` walk to confirm it (R1-6).
+    mouseOver(trigger);
+    const scansBeforeAction = hoverSurfaceScanCounter.count;
+    click(item);
+    capture.dispose();
+
+    expect(steps.map((s) => s.op)).toEqual(["hover", "click"]);
+    expect(hoverSurfaceScanCounter.count).toBe(scansBeforeAction);
+  });
+
+  it("never scans for hover surfaces when an action has no candidate at all", () => {
+    document.body.innerHTML = `<a href="/help">Help</a>`;
+    const capture = startRecordCapture("rec-no-candidate-scan", (step) => steps.push(step));
+    const link = document.querySelector("a")!;
+    mockRect(link, { left: 10, top: 10, width: 80, height: 24 });
+
+    // No mouseover ever produced a candidate and no surface is owned, so a
+    // surface lookup cannot match anything. The action path must short-circuit
+    // instead of walking the whole document for nothing (R1-6).
+    const scansBeforeAction = hoverSurfaceScanCounter.count;
+    click(link);
+    capture.dispose();
+
+    expect(steps).toEqual([
+      expect.objectContaining({ op: "click", target: expect.objectContaining({ name: "Help" }) }),
+    ]);
+    expect(hoverSurfaceScanCounter.count).toBe(scansBeforeAction);
+  });
+
+  it("does not emit a same-action hover step when clicking a has-submenu combobox", () => {
+    // D5-2: the pointer moving to `#story` produces a mouseover whose resolved
+    // hover element is the wrapping `<div role="combobox" aria-haspopup>`.
+    // That wrapper both contains the input and describes the very target the
+    // click records, so replaying it would add a spurious hover step in front of
+    // the click (the 7/8 regression).
+    document.body.innerHTML = `
+      <label id="story-label">* Story</label>
+      <div id="story-picker" role="combobox" aria-haspopup="listbox" aria-expanded="false">
+        <input id="story" aria-labelledby="story-label" placeholder="Type to search" />
+      </div>
+    `;
+    const capture = startRecordCapture("rec-same-action-hover", (step) => steps.push(step));
+    const wrapper = document.querySelector("#story-picker")!;
+    const input = document.querySelector("#story")!;
+    mockRect(wrapper, { left: 300, top: 200, width: 220, height: 36 });
+
+    // Real pointer path: `moveRealPointer` fires mouseover on the wrapper on its
+    // way to the input, then the click lands on the input.
+    mouseOver(wrapper);
+    click(input);
+    capture.dispose();
+
+    expect(steps.map((s) => s.op)).toEqual(["click"]);
+    expect(steps[0]).toMatchObject({
+      op: "click",
+      target: { role: "combobox", name: "* Story" },
+      expects_navigation: false,
+    });
+  });
+
+  it("keeps an explicit hover step when a menu is opened by hovering and its item is clicked later", () => {
+    // The legitimate counterpart (12→13): an explicit `bsk hover` on the opener
+    // is a real, earlier action of its own. The click on the revealed item must
+    // keep both steps even though the opener wrapper contains the click target.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-17T09:00:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <button type="button" aria-label="Account" aria-haspopup="menu" aria-expanded="false">Account</button>
+        <div id="hover-panel" class="account-menu dropdown-menu">
+          <a href="/profile">Profile beta</a>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-explicit-hover-opener", (step) => steps.push(step));
+      const opener = document.querySelector("button")!;
+      const menu = document.querySelector("#hover-panel")!;
+      const item = document.querySelector("a")!;
+      mockRect(opener, { left: 900, top: 8, width: 72, height: 32 });
+      mockRect(menu, { left: 820, top: 48, width: 200, height: 80 });
+
+      mouseOver(opener);
+      vi.setSystemTime(new Date("2026-09-17T09:00:00.500Z"));
+      mouseOver(menu);
+      click(item);
+      capture.dispose();
+
+      expect(steps.map((s) => s.op)).toEqual(["hover", "click"]);
+      expect(steps[0]).toMatchObject({ op: "hover", target: { name: "Account" } });
+      expect(steps[1]).toMatchObject({
+        op: "click",
+        target: { role: "link", name: "Profile beta" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not emit a same-name wrapper hover when the interactive child is clicked", () => {
+    // Pins the D5 §2.4 half of the fix on its own: the wrapper is never written
+    // to `lastClickAt` (only the inner child is), so the timestamp suppression
+    // cannot catch it. Only "candidate describes the same recorded target as
+    // this click, in the same batch" does.
+    document.body.innerHTML = `
+      <div role="button" aria-label="Account" aria-haspopup="menu">
+        <div role="button" aria-haspopup="menu">Account</div>
+      </div>
+    `;
+    const capture = startRecordCapture("rec-same-name-wrapper", (step) => steps.push(step));
+    const wrapper = document.querySelector('[aria-label="Account"]')!;
+    const inner = wrapper.querySelector("div")!;
+    mockRect(wrapper, { left: 900, top: 8, width: 96, height: 32 });
+
+    mouseOver(wrapper);
+    click(inner);
+    capture.dispose();
+
+    expect(steps.map((s) => s.op)).toEqual(["click"]);
+    expect(steps[0]).toMatchObject({ op: "click", target: { role: "button", name: "Account" } });
+  });
+
+  it("samples the same-action hover window before the action-time surface scan (R2-7)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-17T09:00:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <div role="button" aria-label="Account" aria-haspopup="menu">
+          <div role="button" aria-haspopup="menu">Account</div>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-action-clock-before-scan", (step) =>
+        steps.push(step),
+      );
+      const wrapper = document.querySelector('[aria-label="Account"]')!;
+      const inner = wrapper.querySelector("div")!;
+      mockRect(wrapper, { left: 900, top: 8, width: 96, height: 32 });
+
+      // The pointer travelled from the wrapper to the inner control: one action.
+      mouseOver(wrapper);
+
+      // A big document / slow machine: the full-DOM surface scan triggered by
+      // this very action costs 60ms, i.e. more than the whole 50ms same-action
+      // window it is consulted inside. The window measures the pointer's travel,
+      // so the scan's cost must not be charged to it (R2-7).
+      hoverSurfaceScanCounter.onScan = () => {
+        hoverSurfaceScanCounter.onScan = undefined;
+        vi.setSystemTime(new Date(Date.now() + 60));
+      };
+      const scansBeforeAction = hoverSurfaceScanCounter.count;
+      click(inner);
+      capture.dispose();
+
+      // The scan really ran, and the candidate is still this click's own arrival.
+      expect(hoverSurfaceScanCounter.count).toBeGreaterThan(scansBeforeAction);
+      expect(steps.map((s) => s.op)).toEqual(["click"]);
+      expect(steps[0]).toMatchObject({ op: "click", target: { role: "button", name: "Account" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks a click whose target has no recordable descriptor (R2-17)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-17T10:00:00.000Z"));
+    try {
+      document.body.innerHTML = `
+        <div id="bell" role="switch" tabindex="0" aria-haspopup="menu" aria-expanded="false"></div>
+        <div class="create-menu dropdown-menu">
+          <div class="tg-menu-item" tabindex="0">文档C+D</div>
+        </div>
+      `;
+      const capture = startRecordCapture("rec-undescribable-click-mark", (step) =>
+        steps.push(step),
+      );
+      const trigger = document.querySelector("#bell")!;
+      const menu = document.querySelector(".create-menu")!;
+      const item = document.querySelector(".tg-menu-item")!;
+      mockRect(trigger, { left: 900, top: 8, width: 32, height: 32 });
+      mockRect(menu, { left: 820, top: 48, width: 180, height: 80 });
+      mockRect(item, { left: 820, top: 48, width: 160, height: 32 });
+      mockHoverStyle([item]);
+
+      // `#bell` carries no accessible name, so `describeEventTarget` returns null
+      // and the click itself is not recorded — no record, hence previously no
+      // suppression timestamp either. The click is still the action that
+      // describes the hover immediately before it, so it must be marked from the
+      // event target itself and not left to the 50ms window (R2-17).
+      mouseOver(trigger);
+      click(trigger);
+      vi.setSystemTime(new Date("2026-09-17T10:00:05.000Z"));
+      click(item);
+      capture.dispose();
+
+      expect(steps.filter((s) => s.op === "hover")).toHaveLength(0);
+      expect(steps.map((s) => s.op)).toEqual(["click"]);
+      expect(steps[0]).toMatchObject({ op: "click", target: { name: "文档C+D" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a wrapper hover when a different inner child is clicked", () => {
+    // The narrowed D5-2 rule must not swallow a legitimate wrapper hover: the
+    // wrapper declares a different recorded target than the child that is
+    // clicked, so both steps stay.
+    document.body.innerHTML = `
+      <div role="button" aria-label="user avatar" aria-haspopup="menu">
+        <img alt="avatar" />
+        <span role="button" aria-label="Settings">Settings</span>
+      </div>
+      <ul class="user-menu dropdown-menu">
+        <li><a href="/u/me">My profile</a></li>
+      </ul>
+    `;
+    const capture = startRecordCapture("rec-wrapper-hover-child-click", (step) => steps.push(step));
+    const wrapper = document.querySelector('[aria-label="user avatar"]')!;
+    const child = document.querySelector("span")!;
+    const menu = document.querySelector("ul")!;
+    mockRect(wrapper, { left: 900, top: 8, width: 32, height: 32 });
+    mockRect(menu, { left: 820, top: 48, width: 160, height: 80 });
+
+    mouseOver(wrapper);
+    click(child);
+    capture.dispose();
+
+    expect(steps.map((s) => s.op)).toEqual(["hover", "click"]);
+    expect(steps[0]).toMatchObject({ op: "hover", target: { name: "user avatar" } });
+    expect(steps[1]).toMatchObject({ op: "click", target: { name: "Settings" } });
   });
 });

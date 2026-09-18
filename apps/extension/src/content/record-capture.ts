@@ -51,16 +51,49 @@ interface HoverSurfaceNode {
   parent?: HoverSurfaceNode;
 }
 
+/**
+ * The element and descriptor a click is about to record, resolved before the
+ * step is emitted so the pre-action hover replay can tell whether a candidate
+ * is the very target of that click (D5-2).
+ */
+interface PendingClickRecord {
+  element: Element;
+  target: CaptureTargetDescriptor;
+}
+
 type FillableElement = HTMLInputElement | HTMLTextAreaElement | HTMLElement;
 
 const HOVER_BEFORE_CLICK_MAX_MS = 10_000;
+// M4: how long a mouseover candidate may still act as the opener of a later
+// action. Only candidate liveness is bounded by this window (R1-7).
+const HOVER_CANDIDATE_MAX_MS = 10_000;
+// How long a revealed surface stays bound to the opener that revealed it.
+// Deliberately wider than the candidate window: a menu that only appears much
+// later is still the same opener's surface, and the binding must not be
+// dropped early (R1-7).
 const HOVER_SURFACE_CONTEXT_MAX_MS = 30_000;
 const HOVER_REPLACE_SCORE_MARGIN = 50;
 const HOVER_CANDIDATE_LIMIT = 24;
 const HOVER_TRIGGER_LABEL_MAX = 48;
+// D5-2: one action's `mouseMoved` and the `mousePressed` it precedes share an
+// event batch. A candidate recorded inside this window is the pointer merely
+// travelling to the click target, not a separate, deliberate user hover.
+const SAME_ACTION_HOVER_MAX_MS = 50;
 
 function eventTarget(event: Event): EventTarget | null {
   return event.composedPath()[0] ?? event.target;
+}
+
+/**
+ * D5-2 analogue of "same ref": two descriptors name the same recorded target
+ * only when tag, role and visible name all agree.
+ */
+function sameRecordedTarget(
+  a: CaptureTargetDescriptor | null | undefined,
+  b: CaptureTargetDescriptor | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  return a.tag === b.tag && a.role === b.role && a.name === b.name;
 }
 
 function isOverlayTarget(target: EventTarget | null): boolean {
@@ -477,6 +510,11 @@ export function startRecordCapture(
   let pendingHover: HoverCandidate | null = null;
   const recentHoverCandidates: HoverCandidate[] = [];
   const emittedHoverElements = new WeakSet<Element>();
+  // Elements the user already clicked, keyed by the click time. Re-emitting a
+  // hover that happened *before* that click would duplicate the click that
+  // already swallowed it (D2); a hover recorded after the click is a new,
+  // legitimate interaction (R1-3).
+  const lastClickAt = new WeakMap<Element, number>();
   let hoverSurfaceStates = hoverSurfaceStateMap(collectHoverSurfaceStates());
   const hoverSurfaceNodes = new Map<Element, HoverSurfaceNode>();
   let generatedControlClick: Element | null = null;
@@ -622,7 +660,10 @@ export function startRecordCapture(
     return node;
   };
 
-  const ownedSurfaceForAction = (target: Element): HoverSurfaceNode | undefined => {
+  const ownedSurfaceForAction = (
+    target: Element,
+    scanSurfaceStates: () => HoverSurfaceState[],
+  ): HoverSurfaceNode | undefined => {
     const closestSurface = closestHoverSurfaceCandidate(target);
     if (closestSurface) {
       const owned = hoverSurfaceNodes.get(closestSurface);
@@ -630,8 +671,11 @@ export function startRecordCapture(
     }
     const ownedContaining = ownedSurfaceContaining(target);
     if (ownedContaining) return ownedContaining;
+    // Without any hover candidate there is nothing that could own a surface, so
+    // the full-DOM scan below is pure waste on the common click path (R1-6).
+    if (recentHoverCandidates.length === 0 && hoverSurfaceNodes.size === 0) return undefined;
     const now = Date.now();
-    const currentStates = collectHoverSurfaceStates();
+    const currentStates = scanSurfaceStates();
     pruneGoneHoverSurfaces(currentStates);
     const surfaceState = closestSurface
       ? currentStates.find((state) => state.element === closestSurface)
@@ -715,6 +759,11 @@ export function startRecordCapture(
 
   const emitHoverStep = (hover: HoverCandidate) => {
     if (emittedHoverElements.has(hover.element)) return;
+    const clickedAt = lastClickAt.get(hover.element);
+    // `<=` because the hover that immediately precedes a click on the same
+    // element is the one that click already described, even when both land in
+    // the same millisecond.
+    if (clickedAt !== undefined && hover.recordedAt <= clickedAt) return;
     emitStep({
       op: "hover",
       target: hover.target,
@@ -723,10 +772,43 @@ export function startRecordCapture(
     emittedHoverElements.add(hover.element);
   };
 
+  /**
+   * M4: an opener candidate is only still usable when hover-trigger policy
+   * accepted it (`eligible`) or when the surface it opened is currently visible
+   * (hit by `collectHoverSurfaceStates`). Anything else is a stale pass-through
+   * of the mouse path.
+   */
+  const ownsVisibleHoverSurface = (
+    owner: HoverCandidate,
+    visibleSurfaces: () => Set<Element>,
+    surface?: Element,
+  ): boolean => {
+    if (surface && visibleSurfaces().has(surface)) return true;
+    for (const [element, node] of hoverSurfaceNodes) {
+      if (node.owner.element === owner.element && visibleSurfaces().has(element)) return true;
+    }
+    return false;
+  };
+
+  const isUsableHoverOwner = (
+    owner: HoverCandidate,
+    now: number,
+    visibleSurfaces: () => Set<Element>,
+    surface?: Element,
+  ): boolean => {
+    // Fast path: a policy-eligible candidate inside its window is usable
+    // without touching the DOM at all (R1-6).
+    if (owner.eligible && now - owner.recordedAt <= HOVER_CANDIDATE_MAX_MS) return true;
+    // A still-open surface keeps its opener valid even past the candidate
+    // window: the user is demonstrably still acting inside it.
+    return ownsVisibleHoverSurface(owner, visibleSurfaces, surface);
+  };
+
   const surfaceOwnerChain = (
     surface: HoverSurfaceNode,
     actionElement: Element,
     now: number,
+    visibleSurfaces: () => Set<Element>,
   ): HoverCandidate[] => {
     const chain: HoverCandidate[] = [];
     const selected = new WeakSet<Element>();
@@ -743,58 +825,156 @@ export function startRecordCapture(
       }
       if (selected.has(owner.element)) continue;
       if (emittedHoverElements.has(owner.element)) continue;
-      if (now - owner.recordedAt > HOVER_SURFACE_CONTEXT_MAX_MS) continue;
+      if (!isUsableHoverOwner(owner, now, visibleSurfaces, owned.element)) continue;
       selected.add(owner.element);
       chain.push(owner);
     }
     return chain;
   };
 
+  /**
+   * D5-2: a candidate is the click target's own pre-action hover (not an
+   * opener) when it was recorded by the pointer travelling to this very click
+   * (same event batch) and it describes the same recorded target — "same ref /
+   * same name", the D5 §2.4 fallback. The narrow rule is deliberate: a broader
+   * `candidate.element.contains(actionElement)` exclusion drops the hover of a
+   * wrapper that legitimately precedes a click on its inner child.
+   */
+  const isSelfActionHover = (
+    candidate: HoverCandidate,
+    pendingClick: PendingClickRecord | null | undefined,
+    now: number,
+  ): boolean =>
+    !!pendingClick &&
+    now - candidate.recordedAt <= SAME_ACTION_HOVER_MAX_MS &&
+    (candidate.element === pendingClick.element ||
+      sameRecordedTarget(candidate.target, pendingClick.target));
+
   const containedHoverOwnerForAction = (
     actionElement: Element,
     now: number,
+    visibleSurfaces: () => Set<Element>,
+    pendingClick?: PendingClickRecord | null,
   ): HoverCandidate | undefined => {
     for (let index = recentHoverCandidates.length - 1; index >= 0; index -= 1) {
       const candidate = recentHoverCandidates[index];
       if (!candidate) continue;
       if (candidate.element === actionElement) continue;
       if (!candidate.element.contains(actionElement)) continue;
-      if (now - candidate.recordedAt > HOVER_SURFACE_CONTEXT_MAX_MS) continue;
+      if (isSelfActionHover(candidate, pendingClick, now)) continue;
+      if (!isUsableHoverOwner(candidate, now, visibleSurfaces)) continue;
       return candidate;
     }
     return undefined;
   };
 
-  const emitClick = (
+  /**
+   * The same-phase surface owners: the pointer reached this action through the
+   * opener chain, so a candidate in the chain that *is* this very click's
+   * target (same ref / same name, same batch) is the action's arrival, not a
+   * separate hover.
+   */
+  const withoutSelfActionOwners = (
+    chain: HoverCandidate[],
+    pendingClick: PendingClickRecord | null | undefined,
+    now: number,
+  ): HoverCandidate[] =>
+    pendingClick ? chain.filter((owner) => !isSelfActionHover(owner, pendingClick, now)) : chain;
+
+  const markClickedElement = (node: EventTarget | null | undefined, clickedAt: number) => {
+    if (!(node instanceof Element)) return;
+    lastClickAt.set(node, clickedAt);
+    const clickable = resolveClickableElement(node);
+    if (clickable) lastClickAt.set(clickable, clickedAt);
+  };
+
+  /** The exact click this action is about to record, resolved before the hover replay. */
+  const resolveClickRecord = (
     event: MouseEvent,
-    options: { expectsNavigation?: boolean; anchor?: Element } = {},
-  ) => {
-    // Only record clicks an LLM can re-identify (named interactive controls).
-    const eventTargetNode = options.anchor ?? eventTarget(event);
+    options: { anchor?: Element } = {},
+  ): PendingClickRecord | null => {
+    const element = options.anchor ?? eventTarget(event);
     const target = options.anchor
       ? pickerTargetDescriptor(options.anchor)
       : describeEventTarget(eventTarget(event));
-    if (!target) return;
-    const expectsNavigation = options.expectsNavigation ?? true;
+    if (!(element instanceof Element) || !target) return null;
+    return { element, target };
+  };
+
+  /**
+   * D5-2: write the suppression timestamp *now*, before the action's own hover
+   * candidates are replayed. `markClickedElement` used to run inside
+   * `emitClickStep`, i.e. after the replay, so an E3-style candidate produced by
+   * the very same click could still be emitted as a separate step.
+   */
+  const claimClickRecord = (
+    record: PendingClickRecord | null,
+    actionTarget: EventTarget | null,
+  ): PendingClickRecord | null => {
+    const clickedAt = Date.now();
+    // R2-17: the pointer event is the same action whether or not its target can
+    // be described, so the event target itself is marked first. When
+    // `describeEventTarget` / `pickerTargetDescriptor` yields null there is no
+    // `record` to mark, and suppressing this action's own hover would otherwise
+    // rest entirely on the 50ms batch window (R2-7 shows that window is not
+    // reliable).
+    markClickedElement(actionTarget, clickedAt);
+    if (record) markClickedElement(record.element, clickedAt);
+    return record;
+  };
+
+  const emitClickStep = (record: PendingClickRecord, expectsNavigation: boolean): void => {
     // Claiming a navigation makes the next URL change the effect of this click.
     // Opening a list is not a navigation, so it must not absorb a later one.
     if (expectsNavigation) markNavigationAction();
     emitStep({
       op: "click",
-      target,
-      geometry: geometryForEventTarget(eventTargetNode),
+      target: record.target,
+      geometry: geometryForEventTarget(record.element),
       expects_navigation: expectsNavigation,
     });
   };
 
-  const emitHoverCandidateBeforeAction = (actionTarget: EventTarget | null) => {
+  const emitClick = (
+    event: MouseEvent,
+    options: { expectsNavigation?: boolean; anchor?: Element } = {},
+  ): void => {
+    // Only record clicks an LLM can re-identify (named interactive controls).
+    const record = claimClickRecord(resolveClickRecord(event, options), eventTarget(event));
+    if (!record) return;
+    emitClickStep(record, options.expectsNavigation ?? true);
+  };
+
+  const emitHoverCandidateBeforeAction = (
+    actionTarget: EventTarget | null,
+    pendingClick?: PendingClickRecord | null,
+  ) => {
     if (!(actionTarget instanceof Element)) return;
     const actionElement = resolveClickableElement(actionTarget) ?? actionTarget;
-    const surface = ownedSurfaceForAction(actionElement);
+    // One action may inspect the live surfaces at most once, and only when it
+    // actually has to: an eligible owner still inside the candidate window is
+    // accepted without touching the DOM (R1-6).
+    let scannedStates: HoverSurfaceState[] | undefined;
+    let scannedVisible: Set<Element> | undefined;
+    const scanSurfaceStates = (): HoverSurfaceState[] =>
+      (scannedStates ??= collectHoverSurfaceStates());
+    // Measured at action time: a surface hidden since the last mouseover must
+    // not keep its opener alive (M4).
+    const visibleSurfaces = (): Set<Element> =>
+      (scannedVisible ??= new Set(scanSurfaceStates().map((state) => state.element)));
+    // R2-7: this clock measures the gap between the action event and this
+    // check, so it must be read *before* the surface lookup below. That lookup
+    // may run a full `document.querySelectorAll("*")` walk (`scanSurfaceStates`)
+    // on a large document, and that cost belongs to this check, not to the
+    // candidate's age: measuring after it inflates `now - recordedAt` past
+    // SAME_ACTION_HOVER_MAX_MS and replays the action's own hover as a step.
     const now = Date.now();
-    const containedOwner = surface ? undefined : containedHoverOwnerForAction(actionElement, now);
+    const surface = ownedSurfaceForAction(actionElement, scanSurfaceStates);
+    const containedOwner = surface
+      ? undefined
+      : containedHoverOwnerForAction(actionElement, now, visibleSurfaces, pendingClick);
     const hoverChain = surface
-      ? surfaceOwnerChain(surface, actionElement, now)
+      ? surfaceOwnerChain(surface, actionElement, now, visibleSurfaces)
       : containedOwner
         ? [containedOwner]
         : [];
@@ -802,7 +982,8 @@ export function startRecordCapture(
       pendingHover = null;
       return;
     }
-    for (const hover of hoverChain) emitHoverStep(hover);
+    for (const hover of withoutSelfActionOwners(hoverChain, pendingClick, now))
+      emitHoverStep(hover);
     pendingHover = null;
   };
 
@@ -864,14 +1045,18 @@ export function startRecordCapture(
 
     const fillable = fillableFromTarget(target);
     if (fillable) {
-      emitHoverCandidateBeforeAction(fillable);
-      ensureFillSession(fillable);
       // A disabled control cannot become a fill; recording the click would
       // describe an action the page refused.
       const pickerTrigger = isDisabledControl(fillable) ? null : pickerTriggerFor(fillable);
-      if (pickerTrigger) {
-        emitClick(event, { expectsNavigation: false, anchor: pickerTrigger });
-      }
+      // D5-2: the click target is resolved and its suppression timestamp is
+      // written before the pre-action hover replay, so a candidate produced by
+      // this very click cannot be replayed as a separate hover step.
+      const record = pickerTrigger
+        ? claimClickRecord(resolveClickRecord(event, { anchor: pickerTrigger }), eventTarget(event))
+        : null;
+      emitHoverCandidateBeforeAction(fillable, record);
+      ensureFillSession(fillable);
+      if (record) emitClickStep(record, false);
       return;
     }
 
@@ -898,8 +1083,9 @@ export function startRecordCapture(
 
     commitFillSession();
     if (target instanceof Element && target.closest("select")) return;
-    emitHoverCandidateBeforeAction(target);
-    emitClick(event);
+    const record = claimClickRecord(resolveClickRecord(event), eventTarget(event));
+    emitHoverCandidateBeforeAction(target, record);
+    if (record) emitClickStep(record, true);
   };
 
   const onFocusIn = (event: FocusEvent) => {

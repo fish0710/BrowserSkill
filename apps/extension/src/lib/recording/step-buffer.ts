@@ -1,5 +1,5 @@
 import type { RecordStepPayload } from "../record-bridge";
-import { hasRedirectQualifier } from "./navigation-policy";
+import { hasRedirectQualifier, isAgentInitiatedNavigation } from "./navigation-policy";
 import type { RecordingDraftStep, TargetMatchHint } from "./types";
 
 export interface RecordingStepBuffer {
@@ -18,11 +18,13 @@ const NAVIGATION_TRIGGER_WINDOW_MS = 3_000;
 function toDraftStep(
   payload: RecordStepPayload,
   targetHint?: TargetMatchHint,
+  arrivedAt?: number,
 ): RecordingDraftStep | null {
   const pageUrl = payload.page_url;
   const common = {
     ...(pageUrl ? { pageUrl } : {}),
     ...(targetHint ? { targetHint } : {}),
+    ...(arrivedAt !== undefined ? { arrivedAt } : {}),
   };
   switch (payload.op) {
     case "click":
@@ -90,9 +92,23 @@ export function observeRecordedNavigation(
   causedByAction?: boolean,
   transitionType?: string,
   transitionQualifiers?: string[],
+  arrivedAt?: number,
 ): NavigationObserveResult {
   const navigation = buffer.navigation;
   if (!url || url === navigation.currentUrl) return { kind: "noop" };
+  // D5-1 fallback: recordings start from the Agent Window's `about:blank` page.
+  // A commit observed while the buffer holds *nothing at all* is still part of
+  // arming, whatever the cursor says — drop it instead of emitting a leading
+  // navigate step. (The cursor is intentionally left alone so nothing has to be
+  // undone when the real start URL arrives.)
+  //
+  // R2-14: this must stay narrower than "only navigate steps exist". An explicit
+  // `bsk navigate` is a step of its own (E7), and the startup window is already
+  // covered by E12's `acceptingNavigation` gate, so a user who really lands on
+  // an `about:` page after that agent navigation must be recorded, not dropped.
+  if (url.startsWith("about:") && buffer.steps.length === 0) {
+    return { kind: "noop" };
+  }
   navigation.currentUrl = url;
 
   const pendingIsCurrent =
@@ -100,7 +116,22 @@ export function observeRecordedNavigation(
     (navigation.pendingNavigationDeadline === undefined ||
       navigation.pendingNavigationDeadline >= Date.now());
 
-  if (causedByAction === true || (causedByAction === undefined && pendingIsCurrent)) {
+  // D2 §2.3: an explicit agent navigation (`bsk navigate`, address bar, typed)
+  // is a step of its own. It must not be mistaken for the effect of an
+  // earlier click whose intent is still pending — that annotation has no
+  // landing in the v3 trace (`navigatedTo` is v2-only), so the navigation would
+  // vanish entirely. Only a real action-caused or unattributed URL change may
+  // consume the pending intent.
+  const agentInitiated = isAgentInitiatedNavigation({
+    causedByAction,
+    transitionType,
+    transitionQualifiers,
+  });
+
+  if (
+    !agentInitiated &&
+    (causedByAction === true || (causedByAction === undefined && pendingIsCurrent))
+  ) {
     navigation.pendingNavigation = false;
     navigation.pendingNavigationDeadline = undefined;
     const annotatedIndex = annotateLastStepNavigation(buffer, url);
@@ -119,14 +150,25 @@ export function observeRecordedNavigation(
     pageUrl: url,
     transitionType,
     transitionQualifiers,
+    ...(arrivedAt !== undefined ? { arrivedAt } : {}),
   });
   return { kind: "appended", index: buffer.steps.length - 1 };
 }
 
+/**
+ * Append a recorded payload to `buffer`.
+ *
+ * `arrivedAt` is the wall clock at which the caller received the action, taken
+ * before any `await`; it rides on the draft so the pre-state guard in
+ * `RecordingObservationSession.bindDraft` can reject observations sampled after
+ * the action (R1-2). Omitted means "unknown" and the guard falls back to its
+ * own clock.
+ */
 export function appendRecordedPayload(
   buffer: RecordingStepBuffer,
   payload: RecordStepPayload,
   targetHint?: TargetMatchHint,
+  arrivedAt?: number,
 ): number | null {
   if (payload.op === "navigate") {
     if (!payload.url) return null;
@@ -136,12 +178,14 @@ export function appendRecordedPayload(
       payload.navigation_caused_by_action,
       payload.transitionType,
       payload.transitionQualifiers,
+      arrivedAt,
     );
     return result.kind === "appended" ? result.index : null;
   }
   const step = toDraftStep(
     { ...payload, page_url: payload.page_url ?? buffer.navigation.currentUrl },
     targetHint,
+    arrivedAt,
   );
   if (!step) return null;
   buffer.steps.push(step);

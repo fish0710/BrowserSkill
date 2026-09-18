@@ -205,6 +205,13 @@ export class RecordingObservationRuntime {
   ): Promise<void> {
     const draft = drafts[draftIndex];
     if (!draft) return;
+    // Prefer the arrival clock the message listener sampled before any `await`
+    // (R1-2). Falling back to `Date.now()` keeps the old behaviour for drafts
+    // created directly (settle-generated navigations, tests): a capture
+    // triggered below can take hundreds of milliseconds, and the pre-state
+    // guard must compare the observation time against when the action actually
+    // arrived, not against when this queue slot finally ran.
+    const arrivedAt = draft.arrivedAt ?? Date.now();
     const context = this.#context(tabId);
     if (!context.session.cursor.lastSettled) {
       try {
@@ -230,7 +237,18 @@ export class RecordingObservationRuntime {
         geometrySpace: "local",
       };
     }
-    context.session.bindDraft(draft, draftIndex + 1, context.settle.hasPending);
+    // E19: if the previous action's settle has already started reading the DOM,
+    // wait (bounded) for that read instead of letting it be aborted. The
+    // observation it produces is both the previous action's result and this
+    // action's pre-state — the pace-500ms shape where a hover opens a menu and
+    // the click on a menu item arrives while the hover's sample is being read.
+    // Waiting is what makes `cursor.lastSettled` the *fresh* sample before
+    // `bindDraft` looks at it; `bindDraft`'s own E11 guard then decides whether
+    // it is this action's pre-state. A sample that is still waiting for the
+    // document to stop changing is not in flight, so a burst keeps the E9
+    // abort-and-backfill behaviour and does not pay any latency.
+    await context.settle.awaitInFlightSample(arrivedAt);
+    context.session.bindDraft(draft, draftIndex + 1, arrivedAt);
     context.settle.schedule(drafts, draftIndex, scope);
   }
 

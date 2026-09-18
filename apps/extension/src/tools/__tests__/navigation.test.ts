@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import {
+  consumeAgentInitiatedNavigation,
+  resetAgentInitiatedNavigationsForTests,
+} from "@/lib/recording/agent-navigation";
 import { SessionManager } from "@/session-manager/manager";
 import type { CdpRunner } from "@/tools/shared";
 import {
@@ -51,6 +55,8 @@ function makeFakeCdp(opts?: {
   readyStateSequence?: string[];
   /** Make the readyState probe's `Runtime.evaluate` throw (returns null). */
   evaluateThrows?: boolean;
+  /** Make `Page.navigate` report a CDP-level failure (no commit happens). */
+  navigateErrorText?: string;
 }) {
   const readyStates = opts?.readyStateSequence ?? (opts?.readyState ? [opts.readyState] : []);
   let readyStateIdx = 0;
@@ -80,6 +86,7 @@ function makeFakeCdp(opts?: {
       return {
         frameId: opts?.navigateFrameId ?? "frame-1",
         loaderId: opts?.navigateLoaderId ?? "loader-after",
+        ...(opts?.navigateErrorText ? { errorText: opts.navigateErrorText } : {}),
       };
     },
     "Page.reload": () => {
@@ -499,6 +506,24 @@ describe("handleNavigate", () => {
     if ("code" in res) throw new Error(`unexpected error: ${JSON.stringify(res)}`);
     expect(res.reached).toBe("commit");
     expect(fake.listeners.length).toBe(0);
+  });
+});
+
+describe("agent-initiated navigation marker", () => {
+  it("clears the marker when navigate fails without committing", async () => {
+    resetAgentInitiatedNavigationsForTests();
+    const sm = new SessionManager({ agentWindow: fakeAgentWindow([100]) });
+    await sm.start("aa11");
+    const fake = makeFakeCdp({ navigateErrorText: "net::ERR_NAME_NOT_RESOLVED" });
+    const res = await handleNavigate(
+      sm,
+      { session_id: "aa11", url: "https://example.com/", timeout_ms: 1_000 },
+      { cdp: fake.cdp, tabsApi: fake.tabsApi },
+    );
+    expect(res).toMatchObject({ code: "cdp_failed" });
+    // No commit follows a rejected navigate, so the 30s marker must not survive
+    // to misattribute the user's next navigation as agent-initiated.
+    expect(consumeAgentInitiatedNavigation(4)).toBe(false);
   });
 });
 

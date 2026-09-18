@@ -16,6 +16,10 @@
 // `NavigateBackResult` / `NavigateForwardResult` / `ReloadResult`.
 
 import { ChromiumCdp } from "@/browser-driver/chromium-cdp";
+import {
+  clearAgentInitiatedNavigation,
+  noteAgentInitiatedNavigation,
+} from "@/lib/recording/agent-navigation";
 import type { SessionManager } from "@/session-manager/manager";
 import type {
   NavigateBackParams,
@@ -612,6 +616,13 @@ export async function handleNavigate(
   if (isRpcError(target)) return target;
   const denied = enforceAgentWindow(ctx, target, "navigate");
   if (denied) return denied;
+  // D2 §2.3: tell the recorder this URL change is agent-commanded, so it becomes
+  // its own navigate step instead of being absorbed by an unconsumed click
+  // intent the v3 trace cannot express. A command that never commits must not
+  // keep the marker: inside its 30s TTL a *user* navigation on the same tab
+  // would then be attributed to the agent.
+  noteAgentInitiatedNavigation(target.tabId);
+  const dropAgentNavigationMarker = () => clearAgentInitiatedNavigation(target.tabId);
   const dialogCursor = markDialogCursor(deps.cdp, target.tabId);
 
   const waitUntil: WaitUntil = params.wait_until ?? "load";
@@ -630,7 +641,12 @@ export async function handleNavigate(
         waitUntil,
         timeoutMs,
       );
-      if (isRpcError(recovered)) return recovered;
+      // `navigateWithBrowserApi` reports failure via `onErrorOccurred`, which is
+      // a dead end: no commit follows to consume the marker.
+      if (isRpcError(recovered)) {
+        dropAgentNavigationMarker();
+        return recovered;
+      }
       return attachDialogs(deps.cdp, target.tabId, dialogCursor, { ...recovered, url: params.url });
     }
     const expected = cdpLifecycleName(waitUntil);
@@ -672,6 +688,7 @@ export async function handleNavigate(
       waitAbort.abort();
       await waitPromise;
       waitAbort.cleanup();
+      dropAgentNavigationMarker();
       return {
         code: "cdp_failed",
         message: `Page.navigate rejected: ${nav.errorText}`,
@@ -701,6 +718,7 @@ export async function handleNavigate(
       }`,
     });
   } catch (err) {
+    dropAgentNavigationMarker();
     return cdpError(err);
   }
 }
@@ -729,6 +747,8 @@ async function handleHistory(
   if (isRpcError(target)) return target;
   const denied = enforceAgentWindow(ctx, target, `navigate_${direction}`);
   if (denied) return denied;
+  noteAgentInitiatedNavigation(target.tabId);
+  const dropAgentNavigationMarker = () => clearAgentInitiatedNavigation(target.tabId);
   const dialogCursor = markDialogCursor(deps.cdp, target.tabId);
 
   const waitUntil: WaitUntil = params.wait_until ?? "load";
@@ -813,6 +833,7 @@ async function handleHistory(
       }`,
     });
   } catch (err) {
+    dropAgentNavigationMarker();
     return {
       code: "cdp_failed",
       message: err instanceof Error ? err.message : String(err),
@@ -852,6 +873,8 @@ export async function handleReload(
   if (isRpcError(target)) return target;
   const denied = enforceAgentWindow(ctx, target, "reload");
   if (denied) return denied;
+  noteAgentInitiatedNavigation(target.tabId);
+  const dropAgentNavigationMarker = () => clearAgentInitiatedNavigation(target.tabId);
   const dialogCursor = markDialogCursor(deps.cdp, target.tabId);
 
   const waitUntil: WaitUntil = params.wait_until ?? "load";
@@ -872,7 +895,11 @@ export async function handleReload(
         waitUntil,
         timeoutMs,
       );
-      if (isRpcError(recovered)) return recovered;
+      // A browser-API reload that ends on `onErrorOccurred` never commits.
+      if (isRpcError(recovered)) {
+        dropAgentNavigationMarker();
+        return recovered;
+      }
       return attachDialogs(deps.cdp, target.tabId, dialogCursor, {
         ...recovered,
         previous_url: previousUrl,
@@ -926,6 +953,7 @@ export async function handleReload(
       }`,
     });
   } catch (err) {
+    dropAgentNavigationMarker();
     return cdpError(err);
   }
 }

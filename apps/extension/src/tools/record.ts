@@ -19,10 +19,16 @@ import {
   type RecordStopMessage,
 } from "@/lib/record-bridge";
 import {
+  clearAgentInitiatedNavigation,
+  consumeAgentInitiatedNavigation,
+  resetAgentInitiatedNavigationsForTests,
+} from "@/lib/recording/agent-navigation";
+import {
   type RecordFrameCoordinator,
   type RecordingCaptureScope,
   recordFrameCoordinator,
 } from "@/lib/recording/frame-coordinator";
+import { isAgentInitiatedNavigation } from "@/lib/recording/navigation-policy";
 import { RecordingObservationRuntime } from "@/lib/recording/recording-runtime";
 import {
   appendRecordedPayload,
@@ -75,6 +81,13 @@ interface ActiveRecording {
   finishAttempt: Promise<RecordedTrace | null> | null;
   observation: RecordingObservationRuntime | null;
   stoppedBy: StopReason;
+  /**
+   * True once a `record_await` took ownership of this recording's finish
+   * promise. Such a caller receives the trace directly, so the finish path must
+   * not also park it in `chrome.storage.session` — nothing would ever consume
+   * that slot and its 10MB quota would be held for 24h.
+   */
+  awaited: boolean;
   /** Navigation callbacks tracked from event receipt through action enqueue. */
   navigationCallbacks: Set<Promise<void>>;
   /** Synchronous intake gate closed only after finish drains to stability. */
@@ -102,6 +115,241 @@ function isRecordingFinishing(recording: ActiveRecording): boolean {
 }
 
 const recordings = new Map<string, ActiveRecording>();
+
+/**
+ * Detach-mode stopgap (D3 缺陷 2): a `user_finish` trace has no in-process
+ * consumer, so it used to die with the recording. Park the built trace here —
+ * and mirror it into `chrome.storage.session` because an idle MV3 worker is
+ * recycled long before the CLI's later `record stop` — until a stop collects it.
+ * A blocking `record_await` *is* a consumer (see `ActiveRecording.awaited`), and
+ * such a finish must not park a copy: the slot would never be read and would
+ * hold the 10MB session quota for the whole TTL.
+ */
+const FINISHED_TRACE_STORAGE_KEY = "bsk_record_finished";
+/** Recovery window; older entries are dropped rather than replayed. */
+const FINISHED_TRACE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * One slot per session (R2-9). Two detached recordings can be parked at the
+ * same time; a single fixed key let the second `user_finish` silently overwrite
+ * the first one, so the first session's `record stop` saw a foreign `sessionId`
+ * and reported `not_found` — losing that trace for good.
+ */
+function finishedTraceStorageKey(sessionId: string): string {
+  return `${FINISHED_TRACE_STORAGE_KEY}:${sessionId}`;
+}
+
+/** Our slots plus the pre-R2-9 bare key, so a parked old-format slot still drains. */
+function isFinishedTraceStorageKey(key: string): boolean {
+  return key === FINISHED_TRACE_STORAGE_KEY || key.startsWith(`${FINISHED_TRACE_STORAGE_KEY}:`);
+}
+
+interface FinishedTraceStash {
+  sessionId: string;
+  trace: RecordedTrace;
+  stoppedBy: StopReason;
+  finishedAt: number;
+  /** In-flight `chrome.storage.session` write, awaited before a storage read. */
+  persisted: Promise<void>;
+}
+
+const finishedTraces = new Map<string, FinishedTraceStash>();
+
+/** Subset of `chrome.storage.session` we use; absent when nothing is stubbed. */
+interface FinishedTraceStorageApi {
+  /** `null` reads every item, which is how the expiry sweep finds foreign slots. */
+  get(key: string | null): Promise<Record<string, unknown>>;
+  set(items: Record<string, unknown>): Promise<void>;
+  remove(keys: string | string[]): Promise<void>;
+}
+
+function finishedTraceStorage(): FinishedTraceStorageApi | null {
+  if (typeof chrome === "undefined") return null;
+  const area = chrome.storage?.session;
+  if (!area?.get || !area.set || !area.remove) return null;
+  return {
+    get: (key) => area.get(key) as Promise<Record<string, unknown>>,
+    set: (items) => area.set(items),
+    remove: (keys) => area.remove(keys),
+  };
+}
+
+function isFinishedTraceStash(value: unknown): value is Omit<FinishedTraceStash, "persisted"> {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Partial<FinishedTraceStash>;
+  return (
+    typeof entry.sessionId === "string" &&
+    typeof entry.finishedAt === "number" &&
+    typeof entry.trace === "object" &&
+    entry.trace !== null
+  );
+}
+
+function isFinishedTraceFresh(entry: { finishedAt: number }): boolean {
+  return Date.now() - entry.finishedAt <= FINISHED_TRACE_TTL_MS;
+}
+
+interface StoredFinishedTraceSlot {
+  key: string;
+  entry: unknown;
+}
+
+/** Every finished-trace slot in `chrome.storage.session`, whatever its owner. */
+async function readFinishedTraceSlots(): Promise<StoredFinishedTraceSlot[]> {
+  const storage = finishedTraceStorage();
+  if (!storage) return [];
+  try {
+    const all = await storage.get(null);
+    return Object.entries(all)
+      .filter(([key]) => isFinishedTraceStorageKey(key))
+      .map(([key, entry]) => ({ key, entry }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Drop every expired (or unreadable) slot, whoever wrote it (R2-16). Without
+ * this a 25h-old trace — which may still hold unscrubbed page text — sat in
+ * `chrome.storage.session` until the browser restarted.
+ */
+async function sweepExpiredFinishedTraces(): Promise<void> {
+  for (const [sessionId, entry] of finishedTraces) {
+    if (!isFinishedTraceFresh(entry)) finishedTraces.delete(sessionId);
+  }
+  const storage = finishedTraceStorage();
+  if (!storage) return;
+  const slots = await readFinishedTraceSlots();
+  const staleKeys = slots
+    .filter(({ entry }) => !isFinishedTraceStash(entry) || !isFinishedTraceFresh(entry))
+    .map(({ key }) => key);
+  if (staleKeys.length === 0) return;
+  try {
+    await storage.remove(staleKeys);
+  } catch {
+    // A stale slot only costs one recovery miss; never fail the caller on it.
+  }
+}
+
+/**
+ * Drop this session's stored slot. New writes are per-session
+ * (`bsk_record_finished:<sessionId>`), so no ownership check is needed; the
+ * bare legacy key is only removed when it belongs to this session.
+ */
+async function removeStoredFinishedTrace(sessionId: string): Promise<void> {
+  const storage = finishedTraceStorage();
+  if (!storage) return;
+  const ownKey = finishedTraceStorageKey(sessionId);
+  const slots = await readFinishedTraceSlots();
+  const keys = slots
+    .filter(
+      ({ key, entry }) =>
+        key === ownKey || !isFinishedTraceStash(entry) || entry.sessionId === sessionId,
+    )
+    .map(({ key }) => key);
+  if (!keys.includes(ownKey)) keys.push(ownKey);
+  try {
+    await storage.remove(keys);
+  } catch {
+    // Best effort: the caller must not fail because a recovery slot survived.
+  }
+}
+
+/** Park a finished trace so a later `record stop` can still export it. */
+function stashFinishedTrace(sessionId: string, trace: RecordedTrace, stoppedBy: StopReason): void {
+  const storage = finishedTraceStorage();
+  const entry = { sessionId, trace, stoppedBy, finishedAt: Date.now() };
+  const persisted = storage
+    ? storage.set({ [finishedTraceStorageKey(sessionId)]: entry }).catch((err) => {
+        console.warn("[bsk record] could not persist finished trace", err);
+      })
+    : Promise.resolve();
+  finishedTraces.set(sessionId, { ...entry, persisted });
+}
+
+async function clearFinishedTrace(sessionId: string): Promise<void> {
+  finishedTraces.delete(sessionId);
+  await removeStoredFinishedTrace(sessionId);
+}
+
+/**
+ * Collect exactly one parked trace from `chrome.storage.session`, for the case
+ * where this worker is a fresh process after an MV3 recycle.
+ *
+ * Freshness is decided **before** ownership (R2-16): every expired slot is
+ * deleted regardless of which session wrote it, and only then is a fresh slot
+ * matched against `sessionId` and consumed. Expired entries are never replayed.
+ */
+async function takeStoredFinishedTrace(sessionId: string): Promise<RecordedTrace | null> {
+  const storage = finishedTraceStorage();
+  const slots = await readFinishedTraceSlots();
+  const staleKeys: string[] = [];
+  let matchedKey: string | null = null;
+  let matchedEntry: Omit<FinishedTraceStash, "persisted"> | null = null;
+  for (const { key, entry } of slots) {
+    if (!isFinishedTraceStash(entry) || !isFinishedTraceFresh(entry)) {
+      staleKeys.push(key);
+      continue;
+    }
+    if (entry.sessionId !== sessionId) continue;
+    matchedKey = key;
+    matchedEntry = entry;
+  }
+  const removals = matchedKey ? [...staleKeys, matchedKey] : staleKeys;
+  if (storage && removals.length > 0) {
+    try {
+      await storage.remove(removals);
+    } catch {
+      // Same trade-off as above: a surviving slot only costs a recovery miss.
+    }
+  }
+  if (matchedEntry) finishedTraces.delete(sessionId);
+  return matchedEntry?.trace ?? null;
+}
+
+/**
+ * Collect a parked trace exactly once: memory first (the same worker finished
+ * it), then `chrome.storage.session` (this worker is a fresh one). `parked`
+ * keeps priority so a failed storage write still recovers in-process.
+ */
+async function takeFinishedTrace(sessionId: string): Promise<RecordedTrace | null> {
+  const parked = finishedTraces.get(sessionId);
+  if (parked) {
+    finishedTraces.delete(sessionId);
+    // Chrome keeps the worker alive for a pending extension API call, so the
+    // mirror is already written by the time this settles.
+    await parked.persisted;
+  }
+  const stored = await takeStoredFinishedTrace(sessionId);
+  if (parked) return isFinishedTraceFresh(parked) ? parked.trace : null;
+  return stored;
+}
+
+/** Test seam: true while a finished trace is parked for a later `record stop`. */
+export function hasFinishedTraceForTests(sessionId: string): boolean {
+  return finishedTraces.has(sessionId);
+}
+
+/** Test seam: the storage key a session's parked trace is written under. */
+export function finishedTraceStorageKeyForTests(sessionId: string): string {
+  return finishedTraceStorageKey(sessionId);
+}
+
+/** Test seam: arrival clock carried by the newest draft of a live recording. */
+export function lastDraftArrivedAtForTests(sessionId: string): number | undefined {
+  const steps = recordings.get(sessionId)?.steps;
+  return steps?.[steps.length - 1]?.arrivedAt;
+}
+
+/**
+ * Test seam: simulate an MV3 worker recycle. In-flight storage writes settle
+ * first, because Chrome keeps the worker alive for a pending extension API
+ * call; only then does the in-memory map disappear.
+ */
+export async function recycleFinishedTracesForTests(): Promise<void> {
+  await Promise.allSettled([...finishedTraces.values()].map((entry) => entry.persisted));
+  finishedTraces.clear();
+}
 
 const RECORD_START_RETRIES = 3;
 const RECORD_START_RETRY_DELAY_MS = 500;
@@ -336,6 +584,14 @@ export function resetBrowserObservationForTests(): void {
   detachBrowserObservation?.();
   detachBrowserObservation = null;
   recordings.clear();
+  resetAgentInitiatedNavigationsForTests();
+  finishedTraces.clear();
+  void (async () => {
+    const storage = finishedTraceStorage();
+    if (!storage) return;
+    const keys = (await readFinishedTraceSlots()).map((slot) => slot.key);
+    if (keys.length > 0) await storage.remove(keys);
+  })().catch(() => {});
   attachTabObservation = (deps) => attachRecordTabListener(deps);
   attachNavObservation = (deps) => attachRecordNavigationListener(deps);
 }
@@ -369,6 +625,11 @@ export function attachRecordStepListener(deps: RecordDeps = getDefaultDeps()): (
     sendResponse: (response: RecordStepAck) => void,
   ) => {
     if (!isRecordStepMessage(message)) return false;
+    // Sample the arrival clock before any `await` and before the action is
+    // queued (R1-2): the recording queue may first flush redirects and settle a
+    // previous step, and an observation registered in that window was sampled
+    // *after* this action, so it must not become its pre-state.
+    const arrivedAt = Date.now();
     for (const recording of recordings.values()) {
       if (recording.requestId !== message.requestId) continue;
       const source: RecordingCaptureScope | null | undefined = deps.frameCoordinator
@@ -410,6 +671,7 @@ export function attachRecordStepListener(deps: RecordDeps = getDefaultDeps()): (
           stepBufferFor(recording, sourceTabId, message.step.page_url),
           message.step,
           targetHint,
+          arrivedAt,
         );
         if (draftIndex !== null) {
           await processRecordedStep(recording, draftIndex, sourceTabId, source?.producerId);
@@ -645,10 +907,14 @@ export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): ()
 export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps()): () => void {
   const observeMainFrame = (
     tabId: number,
-    url?: string,
-    causedByAction?: boolean,
-    transitionType?: string,
-    transitionQualifiers?: string[],
+    url: string | undefined,
+    causedByAction: boolean | undefined,
+    transitionType: string | undefined,
+    transitionQualifiers: string[] | undefined,
+    // Sampled at the listener entry, before any `await`. Assigning it here and
+    // not in each listener body is deliberate: the fallback below must stay a
+    // per-call default, not a shared mutable clock (R2-11).
+    arrivedAt: number = Date.now(),
   ) => {
     if (!url) return;
     const candidates = [...recordings.values()].filter(
@@ -670,6 +936,10 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
           causedByAction,
           transitionType,
           transitionQualifiers,
+          // R2-11: without this every webNavigation-driven draft carried
+          // `arrivedAt === undefined`, so the pre-state guard let a sample
+          // started *after* the navigation bind as that navigation's pre-state.
+          arrivedAt,
         );
         if (result.kind === "coalesce_redirect") {
           recording.observation?.scheduleRedirect(tabId, recording.steps, result.url);
@@ -690,8 +960,9 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
     }
   };
   const onMainFrameComplete = (tabId: number, url?: string) => {
+    const arrivedAt = Date.now();
     void (async () => {
-      observeMainFrame(tabId, url);
+      observeMainFrame(tabId, url, undefined, undefined, undefined, arrivedAt);
       scheduleRearmForTab(tabId, deps);
     })();
   };
@@ -707,12 +978,26 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
       details: chrome.webNavigation.WebNavigationTransitionCallbackDetails,
     ) => {
       if (details.frameId !== 0) return;
+      // R2-11: the arrival clock before this listener does any work.
+      const arrivedAt = Date.now();
+      // D2 §2.3: a `bsk navigate` (or any explicitly entered URL) commits with
+      // Chrome's own `typed` / `from_address_bar` transition metadata. Report it
+      // as *not* caused by the previously recorded action, so the step buffer
+      // appends an independent navigate step instead of folding it into a
+      // pending click intent that the trace cannot express.
+      const agentInitiated =
+        consumeAgentInitiatedNavigation(details.tabId) ||
+        isAgentInitiatedNavigation({
+          transitionType: details.transitionType,
+          transitionQualifiers: details.transitionQualifiers,
+        });
       observeMainFrame(
         details.tabId,
         details.url,
-        undefined,
+        agentInitiated ? false : undefined,
         details.transitionType,
         details.transitionQualifiers,
+        arrivedAt,
       );
     };
     chrome.webNavigation.onCompleted.addListener(completedListener);
@@ -838,9 +1123,16 @@ async function finishRecordingAttempt(
   await recording.observation?.settleTrailing(recording.tabs.currentTabId, recording.steps);
 
   recording.settled = true;
+  const trace = buildTrace(recording);
+  // `user_finish` has no in-process consumer in detach mode, so park the trace
+  // between building it and dropping the recording. A blocking `record_await`
+  // is such a consumer: it already returned the trace to the CLI, and parking a
+  // copy would leave the session's storage slot unconsumed for its whole TTL.
+  if (recording.stoppedBy === "user_finish" && !recording.awaited) {
+    stashFinishedTrace(sessionId, trace, "user_finish");
+  }
   recordings.delete(sessionId);
   releaseBrowserObservationListenersIfIdle();
-  const trace = buildTrace(recording);
   recording.resolveFinish(trace);
   return trace;
 }
@@ -868,6 +1160,11 @@ export async function handleRecordStart(
       message: `session ${params.session_id} is already recording`,
     };
   }
+  // A new recording takes over the session's recovery slot. Expired slots are
+  // swept first (R2-16): nothing else ever revisits the ordinary path, because
+  // `get(null)` is the only read that can see a foreign or orphaned slot.
+  await sweepExpiredFinishedTraces();
+  await clearFinishedTrace(params.session_id);
   const target = await resolveTargetTab(manager, ctx, params.tab_id, deps.tabsApi);
   if (isRpcError(target)) return target;
 
@@ -917,8 +1214,14 @@ export async function handleRecordStart(
           })
         : null,
     stoppedBy: "user_finish",
+    awaited: false,
     navigationCallbacks: new Set(),
-    acceptingNavigation: true,
+    // D5-1: stay out of the navigation stream until the tab has actually
+    // landed on the start URL. The Agent Window's about:blank commits and the
+    // start navigation's own commit are arming artifacts, not user steps; the
+    // window home page and `Page.navigate` can both commit while this recording
+    // is still registered (listeners attach before the start navigate).
+    acceptingNavigation: false,
     actionQueue: Promise.resolve(),
     lastStepSequenceByProducer: new Map(),
   });
@@ -997,6 +1300,10 @@ export async function handleRecordStart(
       await abortPending(false);
       return nav;
     }
+    // The start navigate is awaited to `load`, so its own commit (if any) has
+    // already consumed the marker. Drop anything left so an uncommitted start
+    // command cannot later misattribute the user's first navigation.
+    clearAgentInitiatedNavigation(target.tabId);
     {
       const cancelled = await abortIfCancelled(false);
       if (cancelled) return cancelled;
@@ -1026,7 +1333,14 @@ export async function handleRecordStart(
     return cancelledError();
   }
   active.startUrl = startUrl;
-  active.tabs.navigation(target.tabId, startUrl).currentUrl = startUrl;
+  // D5-1: the start URL is where recording really begins. Sync the cursor to
+  // the landing page and drop any pending intent left over from arming, then
+  // open the gate so later navigations are observed as usual.
+  const startCursor = active.tabs.navigation(target.tabId, startUrl);
+  startCursor.currentUrl = startUrl;
+  startCursor.pendingNavigation = false;
+  startCursor.pendingNavigationDeadline = undefined;
+  active.acceptingNavigation = true;
 
   if (isContentScriptRestrictedUrl(startUrl)) {
     await abortPending(false);
@@ -1104,6 +1418,10 @@ export async function handleRecordStop(
 
   const recording = recordings.get(params.session_id);
   if (!recording) {
+    // The page already ended the recording (user_finish) and this process was
+    // recycled since; the parked trace is what `record stop` came for.
+    const parked = await takeFinishedTrace(params.session_id);
+    if (parked) return { trace: parked };
     return {
       code: "not_found",
       message: `no active recording for session ${params.session_id}`,
@@ -1117,6 +1435,9 @@ export async function handleRecordStop(
       message: `failed to flush recorded steps for session ${params.session_id}; the recording is still active — retry \`bsk record stop\``,
     };
   }
+  // A concurrent browser finish for this session may have parked a copy; the
+  // caller already holds it, and a later stop must not resurrect it.
+  await clearFinishedTrace(params.session_id);
   return { trace };
 }
 
@@ -1140,6 +1461,9 @@ export async function handleRecordAwait(
     return { code: "cancelled", message: "record_await aborted" };
   }
 
+  // This caller is the consumer of the finish promise, so the finish path must
+  // not park a copy of the trace in `chrome.storage.session` on its way out.
+  recording.awaited = true;
   const outcome = await new Promise<{ trace: RecordedTrace } | { error: RpcError }>((resolve) => {
     let settled = false;
     const finish = (result: { trace: RecordedTrace } | { error: RpcError }) => {
@@ -1172,10 +1496,40 @@ export async function handleRecordAwait(
         }),
     );
   });
-  return "trace" in outcome ? { trace: outcome.trace } : outcome.error;
+  if ("trace" in outcome) {
+    // Belt and braces: a concurrent `record stop` may still have parked a copy
+    // (it wins the finish attempt but not the ownership flag), and a slot whose
+    // trace the CLI already holds is dead weight.
+    await clearFinishedTrace(params.session_id);
+    return { trace: outcome.trace };
+  }
+  // We bailed out (timeout / abort) without receiving a trace, so ownership of
+  // the finish must go back to the detach-mode parking path — the CLI has no
+  // trace and a later `record stop` is the only way to collect it.
+  if (recordings.get(params.session_id) === recording && !recording.settled) {
+    // Still running: the finish attempt has not yet read `awaited`.
+    recording.awaited = false;
+  } else {
+    // The attempt already decided not to park because it saw `awaited`; park
+    // its product here instead (a concurrent `record stop` simply consumes it).
+    void recording.finishPromise.then(
+      (trace) => {
+        if (recording.stoppedBy === "user_finish") {
+          stashFinishedTrace(params.session_id, trace, "user_finish");
+        }
+      },
+      () => {},
+    );
+  }
+  return outcome.error;
 }
 
 export function clearRecordingForSession(sessionId: string): void {
+  // Teardown does **not** touch the parked trace (R2-15): it is the finished
+  // product of a session, not session state, and CLI teardown / an idle reaper
+  // can land between the page's `user_finish` and the CLI's `record stop`. Only
+  // a new `record start` (handleRecordStart) or a consuming `record stop`
+  // (handleRecordStop) clears it.
   const recording = recordings.get(sessionId);
   if (!recording) {
     recordings.delete(sessionId);
