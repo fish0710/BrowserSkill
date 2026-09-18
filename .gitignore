@@ -25,3 +25,6 @@ evals/browser/agents.local.json
 # Environment
 .env.local
 .env.*.local
+
+# Local recordings and evaluation artefacts (contain business traces)
+recordings/
